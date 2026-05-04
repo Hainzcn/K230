@@ -112,6 +112,11 @@ def main():
     snapshot_fail_streak = 0
     detection = None
     img = None
+    # 文字 / FPS / 内存等行 1Hz 由 maybe_update_fps 触发更新；
+    # binary overlay 由 maybe_update_binary 独立频率触发。
+    # render_overlay 始终用最新 detection + 最近一次缓存的 lines 整体重画，
+    # 这样高频 binary 刷新不会让文字行抖动。
+    cached_lines = []
 
     try:
         while True:
@@ -153,6 +158,7 @@ def main():
                         % capture_count
                     )
 
+            # ---- 1Hz 文字行更新（FPS / Q / 内存 / 标定状态）---- #
             if camera.maybe_update_fps(now):
                 cur_mem = gc.mem_free()
                 if cur_mem < mem_min:
@@ -222,7 +228,15 @@ def main():
                         "CAP %d/%d"
                         % (capture_count, config.CAPTURE_MAX_SAMPLES)
                     )
-                camera.render_overlay(lines, detection=detection)
+                # 文字行刷新：缓存最新 lines，并立即重画一次 OSD（含 binary）。
+                cached_lines = lines
+                camera.render_overlay(cached_lines, detection=detection)
+            # ---- binary overlay 独立频率刷新（默认每帧）---- #
+            elif detection is not None and camera.maybe_update_binary(now):
+                # 用 1Hz 缓存的 lines 整体重画，避免 OSD 文字行抖动 / 缺失；
+                # binary overlay 内部只重画 ROI 内红色高亮 + 预览，开销
+                # ~10-30ms，不会拖累 algo FPS 低于 sensor 上限。
+                camera.render_overlay(cached_lines, detection=detection)
 
             # 控制台日志节流：完整指标依然落日志，便于离线分析（plan §13.1）。
             if (

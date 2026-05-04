@@ -280,6 +280,47 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
      在每条带的循环内，减少属性查找。
   实测预期：algo FPS 从 8.8 回到 30+ (sensor 上限)。详见
   `vision/camera._draw_binary_debug` 与 `_draw_row_spans_from_bytes`。
+- [x] **二值 overlay 渲染模式拆分 + preview 独立开关**：用户希望（1）右上角
+  预览能单独关闭；（2）主 ROI 红色高亮做成"完整连续半透明"，而不是只
+  在 5 条带上的片状斑块。K230 `image.draw_rectangle` 签名只接受
+  `(x,y,w,h,color,thickness,fill)`——**不支持 alpha，也不支持 4 元组
+  RGBA**（见 `docs/k230_canmv_docs/api/openmv/image.md`）。硬件 OSD 的
+  ARGB8888 真 alpha 仅能改 buffer 字节，但前述 ulab↔image cache quirk 让
+  这条路风险高。改为：
+  1. 加 `DEBUG_SHOW_BINARY_PREVIEW`（默认 True）与 `DEBUG_SHOW_BINARY`
+     彻底分离；preview / overlay 各自独立判定；
+  2. 加 `OSD_BINARY_OVERLAY_MODE`，最初实现 3 档（`bands_only` /
+     `full_solid` / `full_dither`），后扩展为 5 档（见下条）；
+  3. 全 ROI 扫描共 320×150=48000 次字节索引 ≈ 2.4ms；前景率 ~1-3%
+     场景下 draw_rect 调用 ~300-1000 次，OSD 总耗时 < 30ms。
+  详见 `vision/camera._draw_overlay_full_dither` 与 `_draw_overlay_bands`。
+- [x] **删除 line_detector copy_from MMZ 死路径**：camera.py OSD 改走
+  `bytes(binary_np)` 字节扫描后，``detection.binary_image``（MMZ 镜像）
+  零消费，但 line_detector 每帧仍 `_roi_img.copy_from(src_wrap)` 做
+  ~48 KB memcpy ≈ 1-2 ms。删除后：
+  1. `_roi_img = image.Image(GRAYSCALE)` 构造期 MMZ 分配去掉，常驻内存
+     省一份；
+  2. process() 末尾 copy_from 整段删掉，主路径每帧省 1-2 ms（实测预期
+     L0+L1+L2 从 ~10-13ms 降到 ~9-11ms）；
+  3. L1 关闭时 ALLOC_REF wrap 也不再创建（之前是无条件创建供 copy_from
+     用），又省一次 image.Image 构造。
+  ``DetectionResult.binary_image`` 字段保留为 None，向后兼容。
+  详见 `vision/line_detector.process` / `DetectionResult` docstring。
+- [x] **binary overlay 独立刷新频率 + dither 多档密度**：1Hz overlay 看不出
+  实时变化（红斑跟不上线缆 / 镜头抖动），用户希望可调到每帧；同时希望
+  dither 提供更稀疏档以便每帧时降低 CPU 压力。改为：
+  1. 加 `OSD_BINARY_REFRESH_MS`（默认 0=每帧，正数=ms 节流）；
+     `Camera.maybe_update_binary(now)` 与 `maybe_update_fps` 并列；
+  2. 主循环拆两路触发：`maybe_update_fps`（1Hz）只用来更新 `cached_lines`
+     文字内容；`maybe_update_binary`（每帧 / 用户设定）触发 render_overlay
+     用 `cached_lines` + 最新 `detection` 整体重画，文字行高频时不会抖动；
+  3. dither 扩成 3 档：
+     - `full_dither_50`：(x+y)%2==0 棋盘格，50% 红色密度（旧默认）；
+     - `full_dither_25`：偶行 × 偶列，25% 密度，OSD 矩形数减半；
+     - `full_dither_12`：偶行 × 4 取 1 列，列起点交错避免竖排红线，
+       12.5% 密度，最稀疏，每帧刷新仍 < 10ms；
+  4. 兼容旧名 `full_dither` → 自动映射为 `full_dither_50`。
+  详见 `vision/camera.maybe_update_binary` 与 `_draw_overlay_full_dither`。
 - [x] **IDE 停止信号被调试容错吞掉**：K230/CanMV IDE 的停止请求有时以
   `IDE interrupt` 异常从 `snapshot()` / OSD 绘图 / 图像统计 API 抛出；早期
   为了容错写的 `except Exception` 会把它当普通错误打印后继续循环，导致程序

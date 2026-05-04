@@ -90,12 +90,11 @@ class DetectionResult:
     属性：
 
     - ``bands`` (list[BandResult]) ：5 条带的结果，索引 0=远 -> 4=近
-    - ``binary_np`` (ndarray)      ：``bin_inv_roi``，可供 L2 切片 / 采样使用
-    - ``binary_image`` (image.Image)：与 ``binary_np`` 共享 MMZ 缓冲的 GRAYSCALE
-      ``image.Image``。**必须**通过这个对象（而不是再次 ``ALLOC_REF`` 包装
-      ``binary_np``）传给 ``camera.draw_image``：K230 SDK 的 ``draw_image``
-      读取走 MMZ 物理地址，``image.Image(ALLOC_REF, data=ndarray)`` 这种
-      "header-only wrap" 没绑 MMZ，作为 source / mask 时被静默丢弃。
+    - ``binary_np`` (ndarray)      ：``bin_inv_roi``，前景=255、背景=0；
+      L2 / OSD / 阶段 C ground_mapper 都从这里取数据。
+    - ``binary_image`` (image.Image | None)：历史接口，OSD 旧路径需要 MMZ
+      backed image 做 ``draw_image`` source；新路径 OSD 走 ``bytes(binary_np)``
+      字节扫描，已删除 MMZ 镜像，本字段恒为 None，仅保留以兼容外部读者。
     - ``q_l2`` (float)             ：仅用 L2 子项的 Q 评分（0~100）
     - ``mass_total`` (float)       ：5 条带 mass 之和
     - ``n_valid`` (int)            ：通过硬约束的带数
@@ -194,27 +193,16 @@ class LineDetector:
         # 预创建 arange，避免帧循环 alloc。强制为浮点防止后续乘法 dtype 升级抖动。
         self._arange_x = np.arange(self.W) * 1.0
 
-        # 预分配 ROI 尺寸的 GRAYSCALE image.Image（**MMZ 分配**），用作 OSD
-        # 画 binary 时的 source。
+        # 历史：早期 OSD 通过 ``image.draw_image`` 画 binary，必须有一个 MMZ
+        # 分配的 GRAYSCALE image.Image 作为 source（因为 ALLOC_REF wrap 在
+        # K230 上作为 draw_image source 会静默失败）。当时这里持有
+        # ``self._roi_img = image.Image(roi_w, roi_h, image.GRAYSCALE)``，
+        # process() 末尾再 ``_roi_img.copy_from(src_wrap)`` 把 bin_inv_roi
+        # 搬进 MMZ，每帧 ~48 KB memcpy ≈ 1-2 ms。
         #
-        # 关键教训（实测得到的 K230 quirk）：
-        #   * ``self._roi_img.to_numpy_ref()`` 拿到的 ndarray 视图，文档说
-        #     "共享内存"，但 K230 上 ulab 写入只更新到 CPU cache / ulab 视角，
-        #     **不会同步到 image 模块底层（MMZ DMA 路径）**——表现为 ndarray
-        #     侧能读到新值，但 ``image.draw_image`` / ``get_pixel`` 仍然读到
-        #     旧的全 0。
-        #   * 解决：通过 image 模块自己的 ``copy_from(src_img)`` 把 ALLOC_REF
-        #     wrap 的 ndarray 数据搬进 MMZ，由 image 模块内部处理 cache 同步。
-        #     代价是一次 ~48 KB memcpy，可忽略。
-        #
-        # 因此 process() 真正的流程是：
-        #   1. ``bin_inv_roi = 255 - bin_raw[ROI 行]`` （ndarray，heap）
-        #   2. ALLOC_REF wrap 包装 bin_inv_roi → ``src_wrap``
-        #   3. L1: ``src_wrap.open(1)`` 就地 erode+dilate（ALLOC_REF 写得通）
-        #   4. ``self._roi_img.copy_from(src_wrap)`` 同步进 MMZ
-        #   5. L2 用 bin_inv_roi（ndarray）做行切片
-        #   6. OSD 用 self._roi_img（MMZ）做 draw_image source
-        self._roi_img = image.Image(self._roi_w, self._roi_h, image.GRAYSCALE)
+        # 现在 OSD 已经改走 ``bytes(detection.binary_np)`` + Python 字节扫描，
+        # 不再消费 binary_image，因此 _roi_img + copy_from 整条路径删掉，
+        # 主路径每帧省 1-2 ms。binary_image 字段保留但置 None，向后兼容。
 
         # 预创建可复用的结果容器：bands 列表只在 process 里改字段，不重建。
         self._result = DetectionResult()
@@ -226,8 +214,7 @@ class LineDetector:
             )
             for i in range(self._band_count)
         ]
-        # binary_image 全程指向同一份 _roi_img，buffer 每帧由 copy_from 覆写。
-        self._result.binary_image = self._roi_img
+        self._result.binary_image = None
 
     # ------------------------------------------------------------------ #
     # 主入口
@@ -267,42 +254,27 @@ class LineDetector:
 
         # ---------- 反相到 ROI（黑线 = 前景 = 255） ---------- #
         # 仅对 ROI 行做反相，省一半 alloc / 算力。bin_inv_roi 是 heap-allocated
-        # 的 ulab ndarray，可被 ALLOC_REF wrap 用作 image 模块 source（因为
-        # image 模块对 ALLOC_REF 写得通：open(1) / copy_from 都走得过去）。
+        # 的 ulab ndarray；L2 直接消费它，OSD 通过 ``bytes(bin_inv_roi)``
+        # 物化后扫描，**不再走 image.Image MMZ 路径**——因此既不需要
+        # _roi_img 也不需要 copy_from，主路径每帧省 1-2 ms。
         bin_inv_roi = 255 - bin_raw[self._roi_y : self._roi_y + self._roi_h, :]
-        result.binary_np = bin_inv_roi  # 给 L2 / 外部消费方
-
-        # 用 ALLOC_REF wrap 让 image 模块"看到"这块 ndarray buffer，作为 L1
-        # open(1) 的目标 + copy_from 的 source。
-        try:
-            src_wrap = image.Image(
-                self._roi_w, self._roi_h, image.GRAYSCALE,
-                alloc=image.ALLOC_REF, data=bin_inv_roi,
-            )
-        except Exception as e:
-            reraise_if_stop(e)
-            print("[line_detector] ALLOC_REF wrap failed:", e)
-            src_wrap = None
+        result.binary_np = bin_inv_roi  # 给 L2 / OSD bytes() 消费
 
         # ---------- L1: 形态学开运算（可选） ---------- #
-        # 在 ALLOC_REF wrap 上做 open(1) 实测可行——image 模块写入 wrap buffer
-        # 与 ulab 视角的 bin_inv_roi 是同一块内存。
-        if src_wrap is not None and self._l1_backend == "image_open":
+        # ALLOC_REF wrap 让 image 模块"看到"ndarray buffer 做就地 open(1)，
+        # 实测能正确写回 ulab 视角（image 模块对 ALLOC_REF 写入是 OK 的，
+        # 仅作为 draw_image source / mask 才会静默失败）。L1 关闭时整块
+        # wrap 都不创建，省一次 image.Image 构造。
+        if self._l1_backend == "image_open":
             try:
+                src_wrap = image.Image(
+                    self._roi_w, self._roi_h, image.GRAYSCALE,
+                    alloc=image.ALLOC_REF, data=bin_inv_roi,
+                )
                 src_wrap.open(1)
             except Exception as e:
                 reraise_if_stop(e)
                 print("[line_detector] L1 open(1) failed:", e)
-
-        # 把 ALLOC_REF wrap 的内容复制到 MMZ 分配的 self._roi_img——这一步
-        # 才能让 OSD 端的 draw_image / get_pixel 读到正确数据（绕开 ulab
-        # 视角与 image MMZ 视角之间的 cache 不一致）。
-        if src_wrap is not None:
-            try:
-                self._roi_img.copy_from(src_wrap)
-            except Exception as e:
-                reraise_if_stop(e)
-                print("[line_detector] copy_from(ALLOC_REF→MMZ) failed:", e)
 
         # ---------- L2: 5 条扫描带质心 ---------- #
         bands = result.bands

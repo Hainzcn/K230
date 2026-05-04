@@ -181,8 +181,8 @@ LINE_THRESHOLD_BIAS = 0
 # - LINE_THRESHOLD_MIN / MAX：硬下限 / 上限。Otsu 在病态场景偶尔会给出极低
 #   或极高值（例如全场都是黑色阴影时给 < 20），下限保证黑色目标不会因此完全
 #   不被检出；上限避免过度饱和把背景一起判作前景。
-LINE_THRESHOLD_MIN = 50
-LINE_THRESHOLD_MAX = 200
+LINE_THRESHOLD_MIN = 10
+LINE_THRESHOLD_MAX = 60
 
 # ---------------------------------------------------------------------------
 # 阶段 B：扫描带几何（plan §6.2）
@@ -259,28 +259,53 @@ OSD_CX_INVALID_COLOR = (255, 0, 0)    # 无效带 cx 圆点（红）
 OSD_WIDTH_COLOR = (255, 255, 0)       # 等效宽度水平短线（黄）
 OSD_CX_RADIUS_PX = 4                  # cx 圆点半径
 
-# 二值图叠加：把 bin_inv_roi（前景=黑线像素=255）以红色线段直接画到 OSD
-# 上，肉眼看到的"红色斑块"就是算法当前判定为黑线的像素，便于排查阈值偏差、
+# 二值图叠加：把 bin_inv_roi（前景=黑线像素=255）以红色绘制到 OSD 上，
+# 肉眼看到的"红色斑块"就是算法当前判定为黑线的像素，便于排查阈值偏差、
 # 阴影误检、形态学开运算前后的差异。
-# 实现：不再依赖 osd.draw_image(mask=...)。K230 上该组合会出现静默不显示；
-# camera.py 用 ``bytes(binary_np)`` 一次物化为 Python bytes 后扫描 5 条
-# 检测带（与 L2 实际输入一致），按前景连续段绘制 OSD 矩形。bytes 索引
-# ~50ns，远快于 ulab ``row[x]`` ~100us，整体 OSD 刷新 <5ms。
-# 5 条带覆盖 ROI 高度的 ~27%，剩余 73% 不显示红斑——这是设计预期，因为
-# L2 之外的像素不参与算法。装车后若需要全 ROI 可视化再加 stride 扩展。
-DEBUG_SHOW_BINARY = True
-OSD_BINARY_COLOR = (255, 0, 0)        # 黑线像素叠加色（红）
-# OSD 图元没有逐像素 alpha；保留该配置仅为兼容旧日志/外部脚本。
+# 实现：不依赖 osd.draw_image(mask=...)（K230 上该组合静默不显示）；
+# camera.py 用 ``bytes(binary_np)`` 一次物化为 Python bytes 后扫描 ROI，
+# 按前景像素绘制 OSD 矩形。bytes 索引 ~50ns，远快于 ulab ``row[x]``
+# ~100us。
+DEBUG_SHOW_BINARY = True               # 主画面 ROI 红色 overlay 总开关
+DEBUG_SHOW_BINARY_PREVIEW = False       # 右上角原尺寸黑白预览独立开关
+OSD_BINARY_COLOR = (255, 0, 0)         # 黑线像素叠加色（红）
+# K230 image.draw_rectangle 签名 (x,y,w,h,color,thickness,fill)，**不接受
+# alpha 参数，也不支持 4 元组 RGBA**（见 docs/k230_canmv_docs/api/openmv/
+# image.md `draw_rectangle`）。OSD ARGB8888 真 alpha 通道唯有手写 buffer
+# 才能改，但前面已记录 K230 ulab↔image cache 一致性问题。
+# 因此"半透明"只能靠抖动（dithering）模拟——OSD_BINARY_ALPHA 仅为兼容字段。
 OSD_BINARY_ALPHA = 220
-# ROI 高亮抽样步长。stride_y=2 + fill_rows=True 让每个采样行覆盖
-# stride_y * scale_y = 4 个 display 像素，避免出现"断续红色线条"竖向缝隙；
-# stride_x=1 不抽列，红斑横向连贯。preview 用 stride=(2,2) 进一步降本，
-# 因为预览窗本来就 320×150 小图。
+# overlay 渲染模式（主画面 ROI 红色高亮）：
+#   "bands_only"     : 仅 5 条 L2 扫描带画不透明红色（覆盖 ROI ~27%）；
+#                      CPU 最低，但只能看到 5 条独立带。
+#   "full_solid"     : 全 ROI 画不透明红色矩形（覆盖完整，连续无缝隙）；
+#                      视觉冲击大，但能直接看出"哪些像素 < threshold"。
+#   "full_dither_50" : 全 ROI 棋盘格 (x+y)%2==0 → 50% 红色密度，伪半透明；
+#                      ~24000 个潜在 1x1 OSD 矩形（前景率 ~1-3% → ~360 个）。
+#   "full_dither_25" : 全 ROI 2x2 块取 1 → 25% 红色密度；红斑更轻，
+#                      OSD 矩形数量减半。
+#   "full_dither_12" : 全 ROI 4x2 块取 1 → 12.5% 红色密度；最稀疏，
+#                      OSD 矩形数量再减半，适合 BINARY_REFRESH 提到每帧时。
+#   "full_dither"    : 兼容旧名，等价 "full_dither_50"。
+OSD_BINARY_OVERLAY_MODE = "full_dither_12"
+
+# 二值 overlay 刷新间隔（ms）：
+#   0   = 每帧刷新（与 algo FPS 同步；红斑实时跟随线缆）；
+#   33  = ~30 Hz；
+#   100 = 10 Hz；
+#   1000 = 1 Hz（与 OSD 文字行同频，最省 CPU）；
+# 文字 / FPS / 内存等行仍按 OSD_REFRESH_INTERVAL_MS（1Hz）刷新；
+# binary overlay 独立提频不会导致文字 / ROI 框抖动——render_overlay
+# 始终带着上一次的 lines 缓存做整体重画。
+OSD_BINARY_REFRESH_MS = 0
+# bands_only 模式的抽样步长（仅在 OSD_BINARY_OVERLAY_MODE="bands_only" 时生效）。
 OSD_BINARY_STRIDE_X = 1
 OSD_BINARY_STRIDE_Y = 2
+# preview（右上角窗）的抽样步长。预览本来就 320×150 小图，stride=(2,2)
+# 足够看出形状又能省 OSD 图元数。
 OSD_BINARY_PREVIEW_STRIDE_X = 2
 OSD_BINARY_PREVIEW_STRIDE_Y = 2
-OSD_BINARY_MIN_RUN_PX = 2              # 过滤单像素噪点，降低 OSD 矩形数量
+OSD_BINARY_MIN_RUN_PX = 2              # 过滤单像素噪点（仅 bands_only 用）
 
 # ---------------------------------------------------------------------------
 # 标定文件

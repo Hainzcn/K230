@@ -93,6 +93,29 @@ class Camera:
             getattr(self.cfg, "DEBUG_SHOW_BINARY", False)
             and self.cfg.DEBUG_DISPLAY
         )
+        # 右上角预览独立开关：默认随 DEBUG_SHOW_BINARY，但用户可通过
+        # ``DEBUG_SHOW_BINARY_PREVIEW=False`` 单独关掉预览（保留主 overlay）。
+        self._binary_preview_enabled = (
+            getattr(self.cfg, "DEBUG_SHOW_BINARY_PREVIEW", True)
+            and getattr(self.cfg, "DEBUG_SHOW_BINARY", False)
+            and self.cfg.DEBUG_DISPLAY
+        )
+        # overlay 渲染模式：见 config.OSD_BINARY_OVERLAY_MODE 注释。
+        mode = str(getattr(self.cfg, "OSD_BINARY_OVERLAY_MODE", "bands_only"))
+        # 兼容：旧名 "full_dither" → "full_dither_50"
+        if mode == "full_dither":
+            mode = "full_dither_50"
+        valid_modes = (
+            "bands_only", "full_solid",
+            "full_dither_50", "full_dither_25", "full_dither_12",
+        )
+        if mode not in valid_modes:
+            print("[camera] unknown OSD_BINARY_OVERLAY_MODE=%r, fallback to bands_only" % mode)
+            mode = "bands_only"
+        self._binary_overlay_mode = mode
+        # 二值 overlay 刷新间隔（ms）。0 = 每帧；正数 = 节流。
+        self._binary_refresh_ms = max(0, int(getattr(self.cfg, "OSD_BINARY_REFRESH_MS", 0)))
+        self._last_binary_refresh_ms = 0
         self._binary_dest_x = 0
         self._binary_dest_y = 0
         self._binary_scale_x = 1.0
@@ -216,7 +239,7 @@ class Camera:
             self._osd.clear()
 
         # ---- 二值图叠加：计算坐标（不再预分配 blit/mask 中间图）---- #
-        if self._binary_overlay_enabled:
+        if self._binary_overlay_enabled or self._binary_preview_enabled:
             try:
                 roi_x, roi_y, roi_w, roi_h = self.cfg.ROI_TOTAL_PX
                 sx = self.cfg.DISPLAY_WIDTH / float(self.cfg.ALGO_WIDTH)
@@ -233,9 +256,12 @@ class Camera:
                 # 前 10 次 OSD 刷新打印诊断；之后静默
                 self._binary_dbg_remaining = 10
                 print(
-                    "[camera] binary overlay ON (span renderer): roi=%dx%d  "
-                    "dest=(%d,%d)  scale=(%.2f,%.2f)  preview=(%d,%d)"
+                    "[camera] binary overlay setup: overlay=%s preview=%s "
+                    "mode=%s roi=%dx%d dest=(%d,%d) scale=(%.2f,%.2f) preview=(%d,%d)"
                     % (
+                        self._binary_overlay_enabled,
+                        self._binary_preview_enabled,
+                        self._binary_overlay_mode,
                         roi_w, roi_h,
                         self._binary_dest_x, self._binary_dest_y,
                         sx, sy,
@@ -245,6 +271,7 @@ class Camera:
             except Exception as e:
                 print("[camera] binary overlay setup failed:", e)
                 self._binary_overlay_enabled = False
+                self._binary_preview_enabled = False
 
         return self
 
@@ -403,6 +430,27 @@ class Camera:
             return True
         return False
 
+    def maybe_update_binary(self, now_ms=None):
+        """二值 overlay 是否到了刷新时刻（独立于 FPS 文字行）。
+
+        ``OSD_BINARY_REFRESH_MS=0`` 时永远返回 True（每帧刷新）；正数时按
+        该 ms 间隔节流。返回 True 表示主循环应当调用 :meth:`render_overlay`
+        把最新 ``detection`` 画上 OSD。
+        """
+        if not self.cfg.DEBUG_DISPLAY or self._osd is None:
+            return False
+        if not (self._binary_overlay_enabled or self._binary_preview_enabled):
+            # 二值调试都关了，沿用 maybe_update_fps 的 1Hz 节流就够了。
+            return False
+        if self._binary_refresh_ms <= 0:
+            return True
+        now = now_ms if now_ms is not None else time.ticks_ms()
+        elapsed = time.ticks_diff(now, self._last_binary_refresh_ms)
+        if elapsed >= self._binary_refresh_ms:
+            self._last_binary_refresh_ms = now
+            return True
+        return False
+
     # ------------------------------------------------------------------ #
     # 调试叠加
     # ------------------------------------------------------------------ #
@@ -516,20 +564,25 @@ class Camera:
                 )
 
     def _draw_binary_debug(self, detection):
-        """用前景连续段直接绘制二值图，避开 K230 draw_image/mask 静默失败。
+        """绘制二值图调试 overlay。preview 与 overlay 各自独立。
 
-        实现要点（性能关键）：
+        实现要点：
 
-        - 每帧 ulab ``row[x]`` 索引在 K230 上耗时极高（~50-100us / 次），
-          5 条带 × 8 行 × 320 列 一遍下来 OSD 刷新可达 ~770ms，把 algo FPS
-          从 33 拖到 8。改用 ``bytes(binary_np)`` 一次性物化为 Python bytes
-          后再做扫描，单次字节读 ~50ns，整体 1000× 提速。
-        - preview / overlay 共用同一份 bytes、同一次行扫描，两边各 draw 一次
-          rectangle。
-        - overlay 路径用 ``fill_rows=True`` + stride_y=2 让每个采样行填满
-          stride * scale_y 个 display 像素，消除"断续红色线条"竖向缝隙。
+        1. ``bytes(binary_np)`` 一次物化为 Python bytes（48KB），后续走
+           bytes 索引（~50ns），远快于 ulab ``row[x]`` 索引（~100us）。
+        2. preview（右上角黑白小窗）由 ``DEBUG_SHOW_BINARY_PREVIEW``
+           独立控制，可单独关闭以释放 OSD 区域。
+        3. overlay（主画面 ROI 红色高亮）有三种模式：
+
+           - ``bands_only``  ：仅 5 条 L2 扫描带，覆盖 ROI ~27%（旧默认）；
+           - ``full_solid``  ：全 ROI 不透明红，连续无缝隙；
+           - ``full_dither`` ：全 ROI 棋盘格抖动，1×1 红点伪 ~50% 透明度。
+
+           K230 ``image.draw_rectangle`` 不支持 alpha，硬件 OSD 真半透明
+           只能改 ARGB buffer，但前面记录有 cache 一致性 quirk，因此用
+           dither 抖动模拟。
         """
-        if not self._binary_overlay_enabled:
+        if not (self._binary_overlay_enabled or self._binary_preview_enabled):
             return
         binary_np = getattr(detection, "binary_np", None)
         if binary_np is None:
@@ -542,8 +595,6 @@ class Camera:
         if verbose:
             self._binary_dbg_remaining -= 1
 
-        # 一次性把整块 ROI 二值数据物化为 Python bytes（48 KB），后面所有
-        # 行扫描走 bytes 索引，避开 ulab 的逐元素 Python 索引开销。
         try:
             binary_bytes = bytes(binary_np)
         except Exception:
@@ -561,11 +612,63 @@ class Camera:
             )
             return
 
-        # 先在 OSD 上画预览窗黑底（再画白色前景叠在上面）。
+        preview_count = 0
+        if self._binary_preview_enabled:
+            preview_count = self._draw_preview(
+                binary_bytes, roi_w, roi_h, detection.bands, roi_y_origin
+            )
+
+        overlay_count = 0
+        overlay_mode = self._binary_overlay_mode
+        if self._binary_overlay_enabled:
+            try:
+                if overlay_mode == "full_solid":
+                    overlay_count = self._draw_overlay_full_solid(
+                        binary_bytes, roi_w, roi_h
+                    )
+                elif overlay_mode == "full_dither_50":
+                    overlay_count = self._draw_overlay_full_dither(
+                        binary_bytes, roi_w, roi_h, divisor=2
+                    )
+                elif overlay_mode == "full_dither_25":
+                    overlay_count = self._draw_overlay_full_dither(
+                        binary_bytes, roi_w, roi_h, divisor=4
+                    )
+                elif overlay_mode == "full_dither_12":
+                    overlay_count = self._draw_overlay_full_dither(
+                        binary_bytes, roi_w, roi_h, divisor=8
+                    )
+                else:  # bands_only
+                    overlay_count = self._draw_overlay_bands(
+                        binary_bytes, roi_w, detection.bands, roi_y_origin
+                    )
+            except Exception as e:
+                reraise_if_stop(e)
+                print("[camera.dbg] overlay draw failed:", e)
+
+        if verbose:
+            band_area = self.cfg.BAND_HEIGHT_PX * self.cfg.BAND_COUNT * roi_w
+            fg_band = int(detection.mass_total) // 255 if band_area else 0
+            fg_pct = (100.0 * fg_band / band_area) if band_area else 0.0
+            print(
+                "[camera.dbg] binary thr=%d band_fg=%d/%d (%.1f%%) "
+                "mode=%s preview=%d overlay=%d"
+                % (
+                    detection.threshold_used,
+                    fg_band, band_area, fg_pct,
+                    overlay_mode,
+                    preview_count, overlay_count,
+                )
+            )
+
+    # ------------------------------------------------------------------ #
+    # 二值图绘制：preview / overlay 三种模式
+    # ------------------------------------------------------------------ #
+    def _draw_preview(self, binary_bytes, roi_w, roi_h, bands, roi_y_origin):
+        """右上角黑白预览窗（原 ROI 尺寸）。仅扫 5 条带以省 CPU。"""
         try:
             self._osd.draw_rectangle(
-                self._binary_preview_x,
-                self._binary_preview_y,
+                self._binary_preview_x, self._binary_preview_y,
                 roi_w, roi_h,
                 color=(0, 0, 0), thickness=1, fill=True,
             )
@@ -573,33 +676,13 @@ class Camera:
             reraise_if_stop(e)
             print("[camera.dbg] preview bg failed:", e)
 
-        preview_color = (255, 255, 255)
-        overlay_color = self.cfg.OSD_BINARY_COLOR
-        preview_sx = 1.0
-        preview_sy = 1.0
-        overlay_sx = self._binary_scale_x
-        overlay_sy = self._binary_scale_y
-        # 行 / 列步进。stride_y 越大越省 CPU；row span 用 fill_rows 撑满，
-        # 不留竖向缝隙。
-        preview_stride_x = max(1, int(getattr(self.cfg, "OSD_BINARY_PREVIEW_STRIDE_X", 2)))
-        preview_stride_y = max(1, int(getattr(self.cfg, "OSD_BINARY_PREVIEW_STRIDE_Y", 2)))
-        overlay_stride_x = max(1, int(getattr(self.cfg, "OSD_BINARY_STRIDE_X", 1)))
-        overlay_stride_y = max(1, int(getattr(self.cfg, "OSD_BINARY_STRIDE_Y", 2)))
+        stride_x = max(1, int(getattr(self.cfg, "OSD_BINARY_PREVIEW_STRIDE_X", 2)))
+        stride_y = max(1, int(getattr(self.cfg, "OSD_BINARY_PREVIEW_STRIDE_Y", 2)))
         min_run_px = max(1, int(getattr(self.cfg, "OSD_BINARY_MIN_RUN_PX", 1)))
 
-        preview_dest_x = self._binary_preview_x
-        preview_dest_y = self._binary_preview_y
-        overlay_dest_x = self._binary_dest_x
-        overlay_dest_y = self._binary_dest_y
-
-        preview_spans = 0
-        overlay_spans = 0
-
-        # 5 条带，每条带各扫一次 preview + overlay。
-        # preview 与 overlay 的 stride_y 不一定相同，分别迭代，但都吃同一份
-        # binary_bytes，因此核心成本是字节索引，不重叠。
+        spans = 0
         try:
-            for band in detection.bands:
+            for band in bands:
                 y0 = band.y_top - roi_y_origin
                 y1 = band.y_bot - roi_y_origin
                 if y0 < 0:
@@ -608,63 +691,149 @@ class Camera:
                     y1 = roi_h
                 if y1 <= y0:
                     continue
-
-                # ----- preview（白色，原尺寸，行填满）-----
-                for y in range(y0, y1, preview_stride_y):
-                    preview_spans += self._draw_row_spans_from_bytes(
+                for y in range(y0, y1, stride_y):
+                    spans += self._draw_row_spans_from_bytes(
                         binary_bytes, y, roi_w,
-                        preview_dest_x, preview_dest_y,
-                        preview_sx, preview_sy,
-                        preview_color,
-                        preview_stride_x, preview_stride_y,
-                        True,   # fill_rows: 占满 stride_y 高，消除竖缝
-                        min_run_px,
-                    )
-
-                # ----- overlay（红色，缩放到显示分辨率，行填满）-----
-                for y in range(y0, y1, overlay_stride_y):
-                    overlay_spans += self._draw_row_spans_from_bytes(
-                        binary_bytes, y, roi_w,
-                        overlay_dest_x, overlay_dest_y,
-                        overlay_sx, overlay_sy,
-                        overlay_color,
-                        overlay_stride_x, overlay_stride_y,
-                        True,   # fill_rows: 让红色斑块成片，不再是"断续线条"
-                        min_run_px,
+                        self._binary_preview_x, self._binary_preview_y,
+                        1.0, 1.0, (255, 255, 255),
+                        stride_x, stride_y, True, min_run_px,
                     )
         except Exception as e:
             reraise_if_stop(e)
-            print("[camera.dbg] band span draw failed:", e)
+            print("[camera.dbg] preview band scan failed:", e)
 
-        # 预览窗黄色边框（最后画，盖在内容上）。
         try:
             self._osd.draw_rectangle(
-                self._binary_preview_x - 1,
-                self._binary_preview_y - 1,
+                self._binary_preview_x - 1, self._binary_preview_y - 1,
                 roi_w + 2, roi_h + 2,
                 color=(255, 255, 0), thickness=1,
             )
         except Exception as e:
             reraise_if_stop(e)
             print("[camera.dbg] preview frame failed:", e)
+        return spans
 
-        if verbose:
-            band_area = self.cfg.BAND_HEIGHT_PX * self.cfg.BAND_COUNT * roi_w
-            fg_band = int(detection.mass_total) // 255 if band_area else 0
-            fg_pct = (100.0 * fg_band / band_area) if band_area else 0.0
-            print(
-                "[camera.dbg] binary band spans thr=%d band_fg=%d/%d (%.1f%%) "
-                "preview_spans=%d overlay_spans=%d "
-                "preview_stride=(%d,%d) overlay_stride=(%d,%d)"
-                % (
-                    detection.threshold_used,
-                    fg_band, band_area, fg_pct,
-                    preview_spans,
-                    overlay_spans,
-                    preview_stride_x, preview_stride_y,
-                    overlay_stride_x, overlay_stride_y,
+    def _draw_overlay_bands(self, binary_bytes, roi_w, bands, roi_y_origin):
+        """主画面 overlay：仅 5 条 L2 扫描带（旧默认）。"""
+        stride_x = max(1, int(getattr(self.cfg, "OSD_BINARY_STRIDE_X", 1)))
+        stride_y = max(1, int(getattr(self.cfg, "OSD_BINARY_STRIDE_Y", 2)))
+        min_run_px = max(1, int(getattr(self.cfg, "OSD_BINARY_MIN_RUN_PX", 1)))
+        roi_h = self.cfg.ROI_TOTAL_PX[3]
+        color = self.cfg.OSD_BINARY_COLOR
+        sx = self._binary_scale_x
+        sy = self._binary_scale_y
+        spans = 0
+        for band in bands:
+            y0 = band.y_top - roi_y_origin
+            y1 = band.y_bot - roi_y_origin
+            if y0 < 0:
+                y0 = 0
+            if y1 > roi_h:
+                y1 = roi_h
+            if y1 <= y0:
+                continue
+            for y in range(y0, y1, stride_y):
+                spans += self._draw_row_spans_from_bytes(
+                    binary_bytes, y, roi_w,
+                    self._binary_dest_x, self._binary_dest_y,
+                    sx, sy, color,
+                    stride_x, stride_y, True, min_run_px,
                 )
-            )
+        return spans
+
+    def _draw_overlay_full_solid(self, binary_bytes, roi_w, roi_h):
+        """主画面 overlay：全 ROI 不透明红色，逐行合并连续段画矩形。"""
+        color = self.cfg.OSD_BINARY_COLOR
+        sx = self._binary_scale_x
+        sy = self._binary_scale_y
+        dest_x = self._binary_dest_x
+        dest_y = self._binary_dest_y
+        bb = binary_bytes
+        osd_draw_rect = self._osd.draw_rectangle
+        dh = max(1, int(sy))
+        spans = 0
+        for y in range(roi_h):
+            row_offset = y * roi_w
+            dy = dest_y + int(y * sy)
+            run_start = -1
+            for x in range(roi_w):
+                if bb[row_offset + x] > 0:
+                    if run_start < 0:
+                        run_start = x
+                elif run_start >= 0:
+                    dx = dest_x + int(run_start * sx)
+                    dw = max(1, int((x - run_start) * sx))
+                    osd_draw_rect(dx, dy, dw, dh,
+                                  color=color, thickness=1, fill=True)
+                    spans += 1
+                    run_start = -1
+            if run_start >= 0:
+                dx = dest_x + int(run_start * sx)
+                dw = max(1, int((roi_w - run_start) * sx))
+                osd_draw_rect(dx, dy, dw, dh,
+                              color=color, thickness=1, fill=True)
+                spans += 1
+        return spans
+
+    def _draw_overlay_full_dither(self, binary_bytes, roi_w, roi_h, divisor):
+        """主画面 overlay：全 ROI 抖动模式画 1×1 红点。
+
+        :param divisor: 红色密度倒数，覆盖率 = 1/divisor。
+            - ``2``：(x+y)%2==0 棋盘格 → 50%（伪半透明）
+            - ``4``：偶数行 + 偶数列 → 25%（更轻）
+            - ``8``：偶数行 + 4 取 1 列 → 12.5%（最稀疏，CPU 最低）
+
+        每 OSD 像素是 ``int(sx)×int(sy)``（典型 2×2），相邻位置不画，肉眼
+        看就是均匀的红色滤镜叠加。覆盖完整连续，无几何"片状"或"竖缝"。
+        """
+        color = self.cfg.OSD_BINARY_COLOR
+        sx = self._binary_scale_x
+        sy = self._binary_scale_y
+        dest_x = self._binary_dest_x
+        dest_y = self._binary_dest_y
+        bb = binary_bytes
+        osd_draw_rect = self._osd.draw_rectangle
+        dot_w = max(1, int(sx))
+        dot_h = max(1, int(sy))
+        spans = 0
+
+        if divisor == 2:
+            # 50% 棋盘格
+            for y in range(roi_h):
+                row_offset = y * roi_w
+                dy = dest_y + int(y * sy)
+                x_start = 1 if (y & 1) else 0
+                for x in range(x_start, roi_w, 2):
+                    if bb[row_offset + x] > 0:
+                        dx = dest_x + int(x * sx)
+                        osd_draw_rect(dx, dy, dot_w, dot_h,
+                                      color=color, thickness=1, fill=True)
+                        spans += 1
+        elif divisor == 4:
+            # 25%：偶数行 × 偶数列
+            for y in range(0, roi_h, 2):
+                row_offset = y * roi_w
+                dy = dest_y + int(y * sy)
+                for x in range(0, roi_w, 2):
+                    if bb[row_offset + x] > 0:
+                        dx = dest_x + int(x * sx)
+                        osd_draw_rect(dx, dy, dot_w, dot_h,
+                                      color=color, thickness=1, fill=True)
+                        spans += 1
+        else:
+            # 12.5%（divisor==8 或其他兜底）：偶数行 × 4 取 1 列，
+            # 奇 / 偶 step 的列起点交错以避免出现"竖排红线"。
+            for y in range(0, roi_h, 2):
+                row_offset = y * roi_w
+                dy = dest_y + int(y * sy)
+                x_start = 0 if ((y >> 1) & 1) == 0 else 2
+                for x in range(x_start, roi_w, 4):
+                    if bb[row_offset + x] > 0:
+                        dx = dest_x + int(x * sx)
+                        osd_draw_rect(dx, dy, dot_w, dot_h,
+                                      color=color, thickness=1, fill=True)
+                        spans += 1
+        return spans
 
     def _draw_row_spans_from_bytes(
         self,
@@ -681,20 +850,18 @@ class Camera:
         fill_rows,
         min_run_px,
     ):
-        """从 binary_bytes 的第 y 行扫前景连续段并画到 OSD。
+        """从 binary_bytes 的第 y 行扫前景连续段并画到 OSD（bands_only / preview 用）。
 
-        这是热点函数。访问 ``binary_bytes`` 是纯 Python ``bytes`` 索引
-        （~50ns），远快于 ``binary_np[y][x]`` 这条 ulab 索引链
-        （~50-100us）。每帧 OSD 刷新合计 ~12800 次字节索引，整体 < 5ms。
+        访问 ``binary_bytes`` 是纯 Python ``bytes`` 索引（~50ns），远快于
+        ``binary_np[y][x]`` 这条 ulab 索引链（~50-100us）。每次 OSD
+        刷新合计 ~12800 次字节索引，整体 < 5ms。
         """
         spans = 0
         row_offset = y * src_w
         run_start = -1
         x = 0
-        # 局部别名：减少属性查找开销
         bb = binary_bytes
         osd_draw_rect = self._osd.draw_rectangle
-        # 缩放后的目标 y / 行高（每个采样行覆盖 stride_y 个源行 × scale_y）
         dy = dest_y + int(y * scale_y)
         if fill_rows:
             dh = max(1, int(stride_y * scale_y))
