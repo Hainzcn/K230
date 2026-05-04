@@ -85,6 +85,46 @@ class Camera:
         self._roi_disp_far = self._roi_algo_to_display(self.cfg.ROI_FAR_PX)
 
     # ------------------------------------------------------------------ #
+    # 诊断
+    # ------------------------------------------------------------------ #
+    def log_configured_modes(self):
+        """打印本次请求的 sensor mode 与各通道实际输出尺寸。
+
+        通道编号取自 config（``DISPLAY_CHN``/``ALGO_CHN``），不是 hardcode 的
+        "CHN0/CHN1"——swap 时也不会失真。
+        """
+        if self._sensor is None:
+            return
+        print(
+            "[camera] request: sensor=%dx%d@%d, "
+            "display→CHN%d=%s, algo→CHN%d=%s"
+            % (
+                self.cfg.SENSOR_REQ_WIDTH,
+                self.cfg.SENSOR_REQ_HEIGHT,
+                self.cfg.SENSOR_NOMINAL_FPS,
+                self.cfg.DISPLAY_CHN,
+                self.cfg.DISPLAY_PIXFORMAT,
+                self.cfg.ALGO_CHN,
+                self.cfg.ALGO_PIXFORMAT,
+            )
+        )
+        for role, chn in (("display", self._display_chn),
+                          ("algo   ", self._algo_chn)):
+            try:
+                print(
+                    "[camera] CHN%d (%s): %dx%d"
+                    % (
+                        self.cfg.DISPLAY_CHN if role.strip() == "display"
+                        else self.cfg.ALGO_CHN,
+                        role,
+                        self._sensor.width(chn=chn),
+                        self._sensor.height(chn=chn),
+                    )
+                )
+            except Exception as e:
+                print("[camera] query %s failed: %s" % (role, e))
+
+    # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
     def init(self):
@@ -93,9 +133,20 @@ class Camera:
         遵守官方推荐顺序（参考 camera_single_bind_lcd.py 与 plan §11）：
             Sensor() → reset → set_framesize/pixformat (CHN0) → bind_layer
             → set_framesize/pixformat (CHN1) → Display.init → MediaManager.init
+
+        必须**三件套一起**传给 ``Sensor(width=, height=, fps=)``。只传 fps
+        时驱动会保留默认 1920×1080，而 OV5647 在 1920×1080 下最高 30 FPS
+        （其 60 FPS 只支持 ≤ 1280×720），期望的 fps 会被静默忽略，表现为
+        algo_fps 顽固地停在 30.0 不动。
         """
-        self._sensor = Sensor()
+        self._sensor = Sensor(
+            width=self.cfg.SENSOR_REQ_WIDTH,
+            height=self.cfg.SENSOR_REQ_HEIGHT,
+            fps=self.cfg.SENSOR_NOMINAL_FPS,
+        )
         self._sensor.reset()
+        self._sensor.set_hmirror(True)
+        self._sensor.set_vflip(True)
 
         # ---- CHN0：显示通道 ----
         self._sensor.set_framesize(
@@ -206,16 +257,73 @@ class Camera:
     # FPS 统计
     # ------------------------------------------------------------------ #
     def algo_fps(self):
+        """CHN1 ``snapshot()`` 拉帧的实际速率（float），**唯一可靠的帧率指标**。
+
+        ``snapshot()`` 是阻塞拉帧：在阶段 A 主循环几乎不做事的前提下，
+        这个值同时就是 sensor 对 CHN1 的实际供帧率——不需要另一路"流速率"
+        来做分子分母，两者在这里本来就重合。
+
+        注：``Display.fps()`` 返回的是 LCD VSync（ST7701 约 60 Hz 固定），
+        不是 sensor 出帧率。前两轮把它当 stream FPS 是错的，已全部拆除。
+        """
         return self._algo_fps
 
-    def display_fps(self):
-        try:
-            return Display.fps()
-        except Exception:
-            return 0
+    def algo_period_ms(self):
+        """算法侧平均帧周期（ms）= 1000 / algo_fps，``algo_fps=0`` 时返回 0。"""
+        if self._algo_fps <= 0.0:
+            return 0.0
+        return 1000.0 / self._algo_fps
 
     def frame_count(self):
         return self._frame_count
+
+    # ------------------------------------------------------------------ #
+    # 启动期诊断：raw snapshot 计时
+    # ------------------------------------------------------------------ #
+    def probe_snapshot_timing(self, n_frames=60):
+        """连续阻塞拉 ``n_frames`` 帧，统计每次 snapshot 的微秒耗时分布。
+
+        用于把"snapshot 自身阻塞时间"和"主循环其他开销（exitpoint / Python /
+        IDE 通讯）"分开诊断：
+
+        - 若 snapshot 单次平均 ≈ 16~17 ms（60 FPS 周期），主循环额外 ~13 ms
+          来自 Python/IDE 路径——优化点在主循环外。
+        - 若 snapshot 单次平均 ≈ 30 ms（30 FPS 周期），CHN1 管线本身限速，
+          软件层面没法再压；只能换通道或接受现状。
+
+        探针不计入 ``frame_count`` / ``algo_fps`` 统计；执行完毕主循环再开始。
+        """
+        if self._sensor is None or n_frames <= 0:
+            return
+        samples = []
+        # 先取 1 帧丢弃，避免首帧冷启动偏差污染统计。
+        try:
+            self._sensor.snapshot(chn=self._algo_chn,
+                                  timeout=self.cfg.SNAPSHOT_TIMEOUT_MS)
+        except Exception:
+            pass
+        for _ in range(n_frames):
+            t0 = time.ticks_us()
+            img = self._sensor.snapshot(
+                chn=self._algo_chn,
+                timeout=self.cfg.SNAPSHOT_TIMEOUT_MS,
+            )
+            dt = time.ticks_diff(time.ticks_us(), t0)
+            if img is not None:
+                samples.append(dt)
+        if not samples:
+            print("[camera.probe] no samples collected")
+            return
+        samples.sort()
+        n = len(samples)
+        avg = sum(samples) / n
+        p50 = samples[n // 2]
+        p95 = samples[min(n - 1, int(n * 0.95))]
+        print(
+            "[camera.probe] snapshot x%d  min=%dus  p50=%dus  avg=%.0fus  "
+            "p95=%dus  max=%dus  → fps_eq=%.1f"
+            % (n, samples[0], p50, avg, p95, samples[-1], 1e6 / avg)
+        )
 
     def maybe_update_fps(self, now_ms=None):
         """1 秒内累计的算法帧数换算为 FPS。每 ``OSD_REFRESH_INTERVAL_MS`` 触发一次。"""
@@ -232,10 +340,16 @@ class Camera:
     # 调试叠加
     # ------------------------------------------------------------------ #
     def render_overlay(self, lines=None):
-        """重绘 OSD：3 段 ROI + 总 ROI 外框 + 文本若干。
+        """重绘 OSD：3 段 ROI + 总 ROI 外框 + 若干行文本。
 
         plan §9.2 守则 7：仅在 ``maybe_update_fps`` 返回 ``True`` 时调用，
         不每帧刷新；正式比赛通过 ``DEBUG_DISPLAY=False`` 关闭。
+
+        :param lines: 可迭代，每项可以是 ``str`` 或 ``(text, color)`` 二元组。
+            - ``str``：使用 ``config.OSD_TEXT_COLOR`` 默认颜色；
+            - ``(text, color)``：按给定 ``(R, G, B)`` 颜色；``color=None``
+              时回退默认。告警类信息（丢帧率 / 低内存）应传红色，参见
+              ``config.OSD_ALERT_COLOR``。
         """
         if not self.cfg.DEBUG_DISPLAY or self._osd is None:
             return
@@ -253,9 +367,15 @@ class Camera:
             x = 8
             y = 8
             font_h = self.cfg.OSD_TEXT_SIZE_PX
-            color = self.cfg.OSD_TEXT_COLOR
-            for ln in lines:
-                self._osd.draw_string_advanced(x, y, font_h, ln, color=color)
+            default_color = self.cfg.OSD_TEXT_COLOR
+            for item in lines:
+                if isinstance(item, tuple):
+                    text = item[0]
+                    col = item[1] if len(item) > 1 and item[1] is not None else default_color
+                else:
+                    text = item
+                    col = default_color
+                self._osd.draw_string_advanced(x, y, font_h, text, color=col)
                 y += font_h + 2
 
         Display.show_image(self._osd, x=0, y=0, layer=Display.LAYER_OSD0)

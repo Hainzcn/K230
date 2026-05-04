@@ -3,7 +3,13 @@
 阶段 A 不做任何检测/控制，仅完成：
 
 1. CHN0 / CHN1 双通道初始化与显示绑定（``vision.camera.Camera``）。
-2. 算法 FPS、显示 FPS、累计帧数、剩余内存的 OSD 叠加（每秒刷新一次）。
+2. OSD 叠加：``FPS <algo_fps> (T <period_ms>ms)`` 一行，1 位小数。
+   阶段 A 主循环几乎不做事，``snapshot()`` 是阻塞拉帧，因此 algo_fps
+   同时反映 sensor 对 CHN1 的实际供帧率——单一指标就够，不再引入
+   ``Display.fps()``（那是 LCD VSync，不是 stream 速率，前两轮错把它当
+   分母已修正）。``period_ms`` 超过 ``FRAME_PERIOD_ALERT_MS`` 时整行标红。
+   剩余内存仅在漂移 ≥ ``MEM_DRIFT_ALERT_PCT`` 或低于 ``MEM_LOW_ALERT_BYTES``
+   时才追加显示（同样标红），平时保持 OSD 清爽。
 3. ROI 框的等比例叠加（便于物理装配阶段对镜头视野）。
 4. ``KeyboardInterrupt`` / 异常 / 资源清理的统一保护。
 5. （可选）按 ``config.CAPTURE_*`` 配置周期性把 CHN1 灰度帧落盘为 JPEG，
@@ -72,7 +78,15 @@ def main():
 
     camera = Camera()
     camera.init()
+    # 诊断：打印本次请求的 sensor mode 与各通道实际输出尺寸。与驱动日志里
+    # ``find sensor ..., output WxH@FPS`` 一行对照，就能看出请求是否被接受。
+    camera.log_configured_modes()
     camera.start()
+
+    # 启动期 raw snapshot 计时探针：用于把 snapshot 自身耗时和主循环其他
+    # 开销分开。设 PROBE_SNAPSHOT_FRAMES=0 关闭。
+    if config.PROBE_SNAPSHOT_FRAMES > 0:
+        camera.probe_snapshot_timing(config.PROBE_SNAPSHOT_FRAMES)
 
     # 内存监测：plan §12 阶段 A 验收要求 mem_free 震荡 ≤ 10%
     mem0 = gc.mem_free()
@@ -125,33 +139,53 @@ def main():
                     mem_max = cur_mem
                 last_mem = cur_mem
 
-                # OSD 文本：所有信息一次刷新（plan §9.2 守则 7）
-                lines = [
-                    "Algo  FPS: %.1f" % camera.algo_fps(),
-                    "Disp  FPS: %d" % camera.display_fps(),
-                    "Frames   : %d" % camera.frame_count(),
-                    "Mem      : %d" % cur_mem,
-                    "MemRange : %d~%d" % (mem_min, mem_max),
-                ]
+                mem_drift_pct = (
+                    100.0 * (mem_max - mem_min) / mem_max if mem_max > 0 else 0.0
+                )
+
+                algo_fps = camera.algo_fps()
+                period_ms = camera.algo_period_ms()
+
+                # FPS 行：algo_fps + 帧周期，均 1 位小数；
+                # period > 阈值时整行标红（性能降级第一指标）。
+                fps_text = "FPS %5.1f  (T %5.1f ms)" % (algo_fps, period_ms)
+                fps_color = (
+                    config.OSD_ALERT_COLOR
+                    if period_ms > config.FRAME_PERIOD_ALERT_MS
+                    else None
+                )
+                lines = [(fps_text, fps_color)]
+
+                mem_alert = (
+                    mem_drift_pct >= config.MEM_DRIFT_ALERT_PCT
+                    or cur_mem < config.MEM_LOW_ALERT_BYTES
+                )
+                if mem_alert:
+                    lines.append((
+                        "MEM %d KB  (drift %.1f%%)"
+                        % (cur_mem // 1024, mem_drift_pct),
+                        config.OSD_ALERT_COLOR,
+                    ))
+
                 if capture_enabled:
                     lines.append(
-                        "Capture  : %d/%d"
+                        "CAP %d/%d"
                         % (capture_count, config.CAPTURE_MAX_SAMPLES)
                     )
                 camera.render_overlay(lines)
 
-            # 控制台日志节流
+            # 控制台日志节流：完整指标依然落日志，便于离线分析（plan §13.1）。
             if time.ticks_diff(now, last_log_ms) >= config.LOG_INTERVAL_MS:
                 last_log_ms = now
                 mem_drift_pct = (
                     100.0 * (mem_max - mem_min) / mem_max if mem_max > 0 else 0.0
                 )
                 print(
-                    "[VLT] algo_fps=%.1f disp_fps=%d frames=%d mem=%d "
-                    "(min=%d max=%d drift=%.1f%%)"
+                    "[VLT] algo_fps=%.1f period=%.1fms frames=%d "
+                    "mem=%d (min=%d max=%d drift=%.1f%%)"
                     % (
                         camera.algo_fps(),
-                        camera.display_fps(),
+                        camera.algo_period_ms(),
                         camera.frame_count(),
                         last_mem,
                         mem_min,
