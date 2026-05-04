@@ -1,24 +1,24 @@
-"""K230 视觉循迹主入口（阶段 A：摄像头基础采集）。
+"""K230 视觉循迹主入口（阶段 A 摄像头采集 + 阶段 B 多扫描带检测）。
 
-阶段 A 不做任何检测/控制，仅完成：
+本文件**只负责装配**，不写算法细节（plan §11.3）。
 
-1. CHN0 / CHN1 双通道初始化与显示绑定（``vision.camera.Camera``）。
-2. OSD 叠加：``FPS <algo_fps> (T <period_ms>ms)`` 一行，1 位小数。
-   阶段 A 主循环几乎不做事，``snapshot()`` 是阻塞拉帧，因此 algo_fps
-   同时反映 sensor 对 CHN1 的实际供帧率——单一指标就够，不再引入
-   ``Display.fps()``（那是 LCD VSync，不是 stream 速率，前两轮错把它当
-   分母已修正）。``period_ms`` 超过 ``FRAME_PERIOD_ALERT_MS`` 时整行标红。
-   剩余内存仅在漂移 ≥ ``MEM_DRIFT_ALERT_PCT`` 或低于 ``MEM_LOW_ALERT_BYTES``
-   时才追加显示（同样标红），平时保持 OSD 清爽。
-3. ROI 框的等比例叠加（便于物理装配阶段对镜头视野）。
-4. ``KeyboardInterrupt`` / 异常 / 资源清理的统一保护。
-5. （可选）按 ``config.CAPTURE_*`` 配置周期性把 CHN1 灰度帧落盘为 JPEG，
-   用于满足 plan §12 阶段 A 的 "拍摄静态赛道样张 ≥ 100 张" 任务。
+阶段 A（继承）：
+- CHN0 / CHN1 双通道初始化与显示绑定（``vision.camera.Camera``）；
+- OSD 叠加：``FPS / T / Q_L2 / valid / cx_near`` 文本行 + ROI 框 + 检测可视化；
+- ``KeyboardInterrupt`` / 异常 / 资源清理的统一保护；
+- 可选采样模式（``config.CAPTURE_*``）。
 
-后续阶段（B 起）将在主循环里替换 / 追加：
-``photometric → line_detector → ground_mapper → geometry → estimator
-→ controller → comms``，但本文件仍只负责装配，不写算法细节
-（plan §11.3）。
+阶段 B（新增）：
+- ``vision.photometric.Photometric`` 启动期跑 30 帧 bootstrap 拿到 line_threshold；
+  运行期每 ~1 s 检查 ``μ_bg`` 漂移，超阈值就在背景任务里渐进重标定（不阻塞）。
+- ``vision.line_detector.LineDetector`` 每帧跑 L0 + (可选 L1) + L2，输出
+  5 条扫描带的 cx / mass / width / valid 与 Q_L2 评分。
+- OSD 增加：5 条扫描带边框、每带 cx 圆点（valid 绿/invalid 红）、宽度水平线段、
+  Q_L2 数值文本行；控制台 5 s 节流日志增加 ``q_l2 / valid / cx_near``。
+
+后续阶段（C 起）将在主循环里追加：
+``ground_mapper → geometry → estimator → controller → comms``，
+仍维持本文件 "装配 only" 的职责边界。
 """
 
 import gc
@@ -28,6 +28,9 @@ import time
 
 import config
 from vision.camera import Camera
+from vision.photometric import Photometric
+from vision.line_detector import LineDetector
+from vision.quality import grade as q_grade
 
 
 def _ensure_dir(path):
@@ -88,6 +91,17 @@ def main():
     if config.PROBE_SNAPSHOT_FRAMES > 0:
         camera.probe_snapshot_timing(config.PROBE_SNAPSHOT_FRAMES)
 
+    # 阶段 B：光度 bootstrap + 检测器装配（plan §5.3 + §6.1）
+    photometric = Photometric()
+    detector = LineDetector()
+    if not detector.self_test():
+        print("[VLT] line_detector self_test FAILED; abort")
+        camera.stop()
+        return
+    photometric.bootstrap(camera)
+    if not photometric.self_test():
+        print("[VLT] photometric self_test FAILED; using LINE_THRESHOLD_INIT fallback")
+
     # 内存监测：plan §12 阶段 A 验收要求 mem_free 震荡 ≤ 10%
     mem0 = gc.mem_free()
     mem_min = mem0
@@ -96,10 +110,15 @@ def main():
 
     last_log_ms = time.ticks_ms()
     snapshot_fail_streak = 0
+    detection = None
+    img = None
 
     try:
         while True:
             os.exitpoint()
+            # ticks_ms 放在循环顶部，即使 snapshot 持续失败也能让日志块按
+            # LOG_INTERVAL_MS 节流地报警，不至于静默卡死。
+            now = time.ticks_ms()
 
             img = camera.read_algo_frame()
             if img is None:
@@ -109,6 +128,10 @@ def main():
                     snapshot_fail_streak = 0
                 continue
             snapshot_fail_streak = 0
+
+            # 阶段 B 主算法：光度自适应 + 多扫描带检测
+            photometric.update(img, now)
+            detection = detector.process(img, photometric.threshold)
 
             # 采样落盘
             if (
@@ -130,7 +153,6 @@ def main():
                         % capture_count
                     )
 
-            now = time.ticks_ms()
             if camera.maybe_update_fps(now):
                 cur_mem = gc.mem_free()
                 if cur_mem < mem_min:
@@ -156,6 +178,34 @@ def main():
                 )
                 lines = [(fps_text, fps_color)]
 
+                # 阶段 B：Q_L2 + 有效带数 + cx_near + 阈值
+                q_color = None
+                if detection.q_l2 < config.Q_HOLD:
+                    q_color = config.OSD_ALERT_COLOR
+                lines.append((
+                    "Q %5.1f  V %d/%d  cxN %s  thr %d"
+                    % (
+                        detection.q_l2,
+                        detection.n_valid,
+                        config.BAND_COUNT,
+                        ("%5.1f" % detection.cx_near_px)
+                        if detection.cx_near_px >= 0
+                        else "  -- ",
+                        detection.threshold_used,
+                    ),
+                    q_color,
+                ))
+
+                if photometric.is_recalibrating:
+                    lines.append((
+                        "PHOTO recal %d/%d"
+                        % (
+                            photometric.recalib_counter,
+                            config.PHOTO_BOOTSTRAP_FRAMES,
+                        ),
+                        config.OSD_ALERT_COLOR,
+                    ))
+
                 mem_alert = (
                     mem_drift_pct >= config.MEM_DRIFT_ALERT_PCT
                     or cur_mem < config.MEM_LOW_ALERT_BYTES
@@ -172,27 +222,47 @@ def main():
                         "CAP %d/%d"
                         % (capture_count, config.CAPTURE_MAX_SAMPLES)
                     )
-                camera.render_overlay(lines)
+                camera.render_overlay(lines, detection=detection)
 
             # 控制台日志节流：完整指标依然落日志，便于离线分析（plan §13.1）。
-            if time.ticks_diff(now, last_log_ms) >= config.LOG_INTERVAL_MS:
+            if (
+                detection is not None
+                and time.ticks_diff(now, last_log_ms) >= config.LOG_INTERVAL_MS
+            ):
                 last_log_ms = now
                 mem_drift_pct = (
                     100.0 * (mem_max - mem_min) / mem_max if mem_max > 0 else 0.0
                 )
                 print(
                     "[VLT] algo_fps=%.1f period=%.1fms frames=%d "
+                    "Q=%.1f(%s) V=%d/%d cxN=%.1f cxF=%.1f thr=%d "
+                    "mu=%.1f sig=%.1f%s "
                     "mem=%d (min=%d max=%d drift=%.1f%%)"
                     % (
                         camera.algo_fps(),
                         camera.algo_period_ms(),
                         camera.frame_count(),
+                        detection.q_l2,
+                        q_grade(detection.q_l2),
+                        detection.n_valid,
+                        config.BAND_COUNT,
+                        detection.cx_near_px,
+                        detection.cx_far_px,
+                        detection.threshold_used,
+                        photometric.mu_bg,
+                        photometric.sigma_bg,
+                        " RECAL" if photometric.is_recalibrating else "",
                         last_mem,
                         mem_min,
                         mem_max,
                         mem_drift_pct,
                     )
                 )
+
+            # 关键：在下一轮 snapshot 前释放本轮 Image 引用。Python 赋值会先
+            # 执行右侧 camera.read_algo_frame()，若旧 img 仍被局部变量持有，
+            # K230 CHN1 的 VB buffer 紧张时可能触发 snapshot failed(3)。
+            img = None
 
     except KeyboardInterrupt as e:
         print("[VLT] user stop:", e)
