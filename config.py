@@ -268,6 +268,14 @@ OSD_CX_RADIUS_PX = 4                  # cx 圆点半径
 # ~100us。
 DEBUG_SHOW_BINARY = True               # 主画面 ROI 红色 overlay 总开关
 DEBUG_SHOW_BINARY_PREVIEW = False       # 右上角原尺寸黑白预览独立开关
+
+# 外接按键：控制主画面 ROI 红色 overlay 运行期开关。
+# 接线：IO_42（开放引脚 Header NO.9）-- 按键 -- GND；软件启用上拉。
+DEBUG_BINARY_BUTTON_ENABLE = True
+DEBUG_BINARY_BUTTON_IO = 42
+DEBUG_BINARY_BUTTON_ACTIVE_LOW = True
+DEBUG_BINARY_BUTTON_DEBOUNCE_MS = 80
+
 OSD_BINARY_COLOR = (255, 0, 0)         # 黑线像素叠加色（红）
 # K230 image.draw_rectangle 签名 (x,y,w,h,color,thickness,fill)，**不接受
 # alpha 参数，也不支持 4 元组 RGBA**（见 docs/k230_canmv_docs/api/openmv/

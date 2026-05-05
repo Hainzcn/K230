@@ -327,6 +327,21 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
   无法终止。修复：新增 `vision.interrupts.reraise_if_stop()`，在 camera /
   line_detector / photometric 的宽泛异常处理里遇到 `KeyboardInterrupt` 或
   `IDE interrupt` 立即重新抛出，让主入口进入 `finally` 正常释放资源。
+- [x] **外接按键控制主 ROI 红色 overlay**：调试时需要在不重启程序、不改
+  `config.py` 的情况下开关 `DEBUG_SHOW_BINARY` 对应的主画面红色二值叠加。
+  选用开放引脚表中的 Header NO.9 / `IO_42`：按键一端接 `IO_42`，另一端接
+  `GND`，软件启用 `Pin.PULL_UP`，未按下为高电平、按下为低电平。实现：
+  1. `config.py` 增加 `DEBUG_BINARY_BUTTON_*` 配置，默认 `IO_42`、低电平
+     有效、80 ms 去抖；
+  2. 新增 `vision/gpio_button.py`，封装 `FPIOA.set_function(IO, FPIOA.GPIOx)`
+     与 `Pin(IO, Pin.IN, pull=Pin.PULL_UP)`，主循环轮询并只在稳定按下沿返回
+     一次事件，长按不重复触发；
+  3. `Camera` 增加 `binary_overlay_enabled()` /
+     `set_binary_overlay_enabled()`，运行期更新已缓存的 `_binary_overlay_enabled`；
+  4. `vision_line_tracking.py` 每帧轮询按键，触发后立即
+     `render_overlay(cached_lines, detection=detection)`，并在 OSD 文字行显示
+     `BIN ON/OFF`。本地 linter 与 Python AST 语法检查通过；板端还需实测按键
+     翻转和去抖效果。
 - [ ] **OSD 信息密度**：阶段 B 加了 Q/V/cxN/thr 一行，逼近 3 行 OSD 上限；
   阶段 C 起 IPM 后会再加 `e_y_mm / ψ_e_mrad / R̂_mm`，需要决定是否拆
   `debug_overlay.py` 单独模块。

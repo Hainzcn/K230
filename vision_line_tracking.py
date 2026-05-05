@@ -28,6 +28,7 @@ import time
 
 import config
 from vision.camera import Camera
+from vision.gpio_button import GpioButton
 from vision.photometric import Photometric
 from vision.line_detector import LineDetector
 from vision.quality import grade as q_grade
@@ -85,6 +86,7 @@ def main():
     # ``find sensor ..., output WxH@FPS`` 一行对照，就能看出请求是否被接受。
     camera.log_configured_modes()
     camera.start()
+    binary_button = GpioButton(config, name="binary_overlay")
 
     # 启动期 raw snapshot 计时探针：用于把 snapshot 自身耗时和主循环其他
     # 开销分开。设 PROBE_SNAPSHOT_FRAMES=0 关闭。
@@ -137,6 +139,11 @@ def main():
             # 阶段 B 主算法：光度自适应 + 多扫描带检测
             photometric.update(img, now)
             detection = detector.process(img, photometric.threshold)
+
+            if binary_button.poll(now):
+                enabled = not camera.binary_overlay_enabled()
+                if camera.set_binary_overlay_enabled(enabled):
+                    camera.render_overlay(cached_lines, detection=detection)
 
             # 采样落盘
             if (
@@ -228,6 +235,10 @@ def main():
                         "CAP %d/%d"
                         % (capture_count, config.CAPTURE_MAX_SAMPLES)
                     )
+                lines.append(
+                    "BIN %s"
+                    % ("ON" if camera.binary_overlay_enabled() else "OFF")
+                )
                 # 文字行刷新：缓存最新 lines，并立即重画一次 OSD（含 binary）。
                 cached_lines = lines
                 camera.render_overlay(cached_lines, detection=detection)

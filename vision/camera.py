@@ -451,6 +451,23 @@ class Camera:
             return True
         return False
 
+    def binary_overlay_enabled(self):
+        """返回主画面 ROI 红色二值 overlay 当前运行期状态。"""
+        return bool(self._binary_overlay_enabled)
+
+    def set_binary_overlay_enabled(self, enabled):
+        """运行期切换主画面 ROI 红色二值 overlay。"""
+        next_enabled = bool(enabled) and self.cfg.DEBUG_DISPLAY
+        if next_enabled == self._binary_overlay_enabled:
+            return False
+        self._binary_overlay_enabled = next_enabled
+        self._last_binary_refresh_ms = 0
+        print(
+            "[camera] binary overlay %s"
+            % ("ON" if self._binary_overlay_enabled else "OFF")
+        )
+        return True
+
     # ------------------------------------------------------------------ #
     # 调试叠加
     # ------------------------------------------------------------------ #
