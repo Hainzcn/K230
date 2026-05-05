@@ -377,7 +377,7 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 - [x] **binary overlay 独立刷新频率 + dither 多档密度**：1Hz overlay 看不出
   实时变化（红斑跟不上线缆 / 镜头抖动），用户希望可调到每帧；同时希望
   dither 提供更稀疏档以便每帧时降低 CPU 压力。改为：
-  1. 加 `OSD_BINARY_REFRESH_MS`（默认 0=每帧，正数=ms 节流）；
+  1. 加 `OSD_BINARY_REFRESH_MS`（当前默认 100ms≈10Hz；0=每帧，正数=ms 节流）；
      `Camera.maybe_update_binary(now)` 与 `maybe_update_fps` 并列；
   2. 主循环拆两路触发：`maybe_update_fps`（1Hz）只用来更新 `cached_lines`
      文字内容；`maybe_update_binary`（每帧 / 用户设定）触发 render_overlay

@@ -261,6 +261,9 @@ class LineDetector:
 
         # 预创建 arange，避免帧循环 alloc。强制为浮点防止后续乘法 dtype 升级抖动。
         self._arange_x = np.arange(self.W) * 1.0
+        # K230 实板一旦发现 ulab 的 bool sum / 加权 sum 语义异常，就切到
+        # bytes(col_sum) 解析；避免之后每条带都先走一次已知会失败的 ulab 路径。
+        self._prefer_bytes_col_stats = False
 
         # 历史：早期 OSD 通过 ``image.draw_image`` 画 binary，必须有一个 MMZ
         # 分配的 GRAYSCALE image.Image 作为 source（因为 ALLOC_REF wrap 在
@@ -400,18 +403,42 @@ class LineDetector:
             band.mass = mass
             mass_total += mass
 
+            col_stats = None
+            if self._prefer_bytes_col_stats:
+                col_stats = _col_sum_stats_from_bytes(
+                    col_sum, self._roi_w, self._col_sum_thr
+                )
+
             # 等效宽度：col_sum 中超过阈值的列数。
             # ulab 的比较在不同固件上可能返回 bool(1) 或 uint8(255)；
             # 因此 sum 结果若超过 ROI 宽度，就退回 Python 计数（每带 320 次）。
-            try:
-                width_mask = col_sum > self._col_sum_thr
-                band.width_px = int(np.sum(width_mask))
-                if band.width_px > self._roi_w:
-                    stats = _col_sum_stats_from_bytes(
+            if col_stats is not None:
+                band.width_px = col_stats[0]
+            else:
+                try:
+                    width_mask = col_sum > self._col_sum_thr
+                    band.width_px = int(np.sum(width_mask))
+                    if band.width_px > self._roi_w:
+                        col_stats = _col_sum_stats_from_bytes(
+                            col_sum, self._roi_w, self._col_sum_thr
+                        )
+                        if col_stats is not None:
+                            self._prefer_bytes_col_stats = True
+                            band.width_px = col_stats[0]
+                        else:
+                            w = 0
+                            thr = self._col_sum_thr
+                            for v in col_sum:
+                                if _scalar_to_int(v) > thr:
+                                    w += 1
+                            band.width_px = w
+                except Exception:
+                    col_stats = _col_sum_stats_from_bytes(
                         col_sum, self._roi_w, self._col_sum_thr
                     )
-                    if stats is not None:
-                        band.width_px = stats[0]
+                    if col_stats is not None:
+                        self._prefer_bytes_col_stats = True
+                        band.width_px = col_stats[0]
                     else:
                         w = 0
                         thr = self._col_sum_thr
@@ -419,19 +446,6 @@ class LineDetector:
                             if _scalar_to_int(v) > thr:
                                 w += 1
                         band.width_px = w
-            except Exception:
-                stats = _col_sum_stats_from_bytes(
-                    col_sum, self._roi_w, self._col_sum_thr
-                )
-                if stats is not None:
-                    band.width_px = stats[0]
-                else:
-                    w = 0
-                    thr = self._col_sum_thr
-                    for v in col_sum:
-                        if _scalar_to_int(v) > thr:
-                            w += 1
-                    band.width_px = w
 
             # 硬约束：mass / 宽度 / 与上一有效带的 Δcx
             if mass < self._min_mass[i]:
@@ -440,15 +454,21 @@ class LineDetector:
                 prev_cx = -1.0
                 continue
 
-            cx = float(np.sum(self._arange_x * col_sum) / mass)
+            if col_stats is not None:
+                cx = col_stats[1] / mass
+            else:
+                cx = float(np.sum(self._arange_x * col_sum) / mass)
             # K230 ulab 还可能在 1-D 加权求和里把 col_sum 当标量广播，
             # 表现为 cx≈sum(0..319)=51040。遇到越界值时退回按列加权求和。
             if cx < 0.0 or cx >= float(self._roi_w):
-                stats = _col_sum_stats_from_bytes(
+                col_stats = _col_sum_stats_from_bytes(
                     col_sum, self._roi_w, self._col_sum_thr
                 )
-                weighted = stats[1] if stats is not None else 0.0
-                if stats is None:
+                weighted = col_stats[1] if col_stats is not None else 0.0
+                if col_stats is not None:
+                    self._prefer_bytes_col_stats = True
+                    band.width_px = col_stats[0]
+                else:
                     x = 0
                     for v in col_sum:
                         weighted += x * _scalar_to_int(v)
@@ -506,6 +526,7 @@ class LineDetector:
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
+
     def _reset_bands_invalid(self, reason):
         for band in self._result.bands:
             band.valid = False

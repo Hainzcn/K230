@@ -341,7 +341,7 @@ OSD_BINARY_OVERLAY_MODE = "full_dither_12"
 # 二值 overlay 刷新间隔（ms）：
 #   0   = 每帧刷新（与 algo FPS 同步；红斑实时跟随线缆）；
 #   33  = ~30 Hz；
-#   100 = 10 Hz；
+#   100 = 10 Hz（推荐默认；肉眼仍能看出二值区域变化，明显减轻 OSD 压力）；
 #   1000 = 1 Hz（与 OSD 文字行同频，最省 CPU）；
 # 文字 / FPS / 内存等行仍按 OSD_REFRESH_INTERVAL_MS（1Hz）刷新；
 # binary overlay 独立提频不会导致文字 / ROI 框抖动——render_overlay
