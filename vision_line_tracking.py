@@ -65,10 +65,34 @@ def _setup_capture():
     return ok
 
 
+def _format_band_diag(detection):
+    """把 5 条扫描带的 L2 结果压成一行，便于板端日志排查硬约束。"""
+    parts = []
+    for b in detection.bands:
+        parts.append(
+            "%d:m=%.0f,w=%d,cx=%.1f,%s"
+            % (
+                b.idx,
+                b.mass,
+                b.width_px,
+                b.cx_px,
+                "ok" if b.valid else (b.reject or "invalid"),
+            )
+        )
+    return "; ".join(parts)
+
+
 def main():
     print(
-        "[VLT] vision_line_tracking start, config=%s, debug=%s"
-        % (config.CONFIG_VERSION, config.DEBUG_DISPLAY)
+        "[VLT] vision_line_tracking start, config=%s, debug=%s, profile=%s"
+        % (config.CONFIG_VERSION, config.DEBUG_DISPLAY,
+           getattr(config, "LINE_DETECTION_PROFILE", "track"))
+    )
+    print(
+        "[VLT] L2 thresholds: MIN_MASS=%s W=[%s..%s] COL_THR=%d Δcx_max=%d"
+        % (config.MIN_MASS_PER_BAND,
+           config.W_MIN_PX_PER_BAND, config.W_MAX_PX_PER_BAND,
+           config.COL_SUM_THR_FOR_WIDTH, config.DELTA_CX_MAX_PX)
     )
 
     if config.GC_THRESHOLD_BYTES > 0:
@@ -283,6 +307,15 @@ def main():
                         mem_drift_pct,
                     )
                 )
+                if detection.n_valid == 0 or detection.cx_near_px < 0:
+                    print(
+                        "[VLT.band] mass_total=%.0f fg≈%.0f bands: %s"
+                        % (
+                            detection.mass_total,
+                            detection.mass_total / 255.0,
+                            _format_band_diag(detection),
+                        )
+                    )
 
             # 关键：在下一轮 snapshot 前释放本轮 Image 引用。Python 赋值会先
             # 执行右侧 camera.read_algo_frame()，若旧 img 仍被局部变量持有，

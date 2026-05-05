@@ -40,6 +40,75 @@ from vision.interrupts import reraise_if_stop
 from vision.quality import compute_q_l2
 
 
+def _scalar_to_int(v):
+    """把 K230 ulab 迭代出的标量转成 Python int。
+
+    部分固件上 ``for v in ndarray`` 会给出普通数字；也有固件会给出
+    ``'\x00\x00'`` 这类 2 字节小端字符串。这里统一解成整数。
+    """
+    try:
+        return int(v)
+    except Exception:
+        pass
+    if isinstance(v, str):
+        n = 0
+        shift = 0
+        for ch in v:
+            n += ord(ch) << shift
+            shift += 8
+        return n
+    try:
+        n = 0
+        shift = 0
+        for b in v:
+            n += int(b) << shift
+            shift += 8
+        return n
+    except Exception:
+        return 0
+
+
+def _byte_to_int(b):
+    """MicroPython / CPython 兼容地读取 bytes 单项。"""
+    if isinstance(b, int):
+        return b
+    return ord(b)
+
+
+def _col_sum_stats_from_bytes(col_sum, roi_w, threshold):
+    """用原始 bytes 快速计算 col_sum 的 width 与加权和。
+
+    K230 上直接迭代 ulab 标量会产出 ``'\x00\x00'``，逐点转换很慢；bytes()
+    后按小端整数解码，能避免每列一次异常。
+    """
+    try:
+        raw = bytes(col_sum)
+    except Exception:
+        return None
+    n = len(raw)
+    if roi_w <= 0 or n < roi_w:
+        return None
+    stride = n // roi_w
+    if stride <= 0:
+        return None
+
+    width = 0
+    weighted = 0.0
+    off = 0
+    for x in range(roi_w):
+        v = 0
+        shift = 0
+        end = off + stride
+        while off < end:
+            v += _byte_to_int(raw[off]) << shift
+            shift += 8
+            off += 1
+        if v > threshold:
+            width += 1
+        weighted += x * v
+    return width, weighted
+
+
 class BandResult:
     """单条扫描带的检测结果。
 
@@ -294,27 +363,75 @@ class LineDetector:
             band_slice = bin_inv_roi[y_top_rel : y_top_rel + self._band_h, :]
 
             # 列向求和：8 行 × 320 列 → 320 长向量。
-            # K230 ulab 的 ndarray 没有 ``.sum()`` 实例方法（只在新版 ulab 上才有），
-            # 这里**统一使用函数式** ``np.sum(arr, axis=...)``，避免
-            # AttributeError: 'ndarray' object has no attribute 'sum'。
-            col_sum = np.sum(band_slice, axis=0)
+            #
+            # **K230 ulab quirk（实测踩到）**：``np.sum(band_slice, axis=0)``
+            # 在 K230 当前固件上**忽略 axis 参数**，对 (8, 320) 输入返回标量
+            # 总和（等价 ``np.sum(band_slice)``）。下游 ``arange_x * col_sum``
+            # 会被 broadcast 成 ``arange_x * scalar``，于是
+            #   cx = sum(arange_x * scalar) / mass = scalar * sum(arange_x) / mass
+            # 当 mass ≈ scalar 时（band_slice 求和后等于 mass），cx 退化为
+            # ``sum(arange_x) = 0+1+...+(W-1) = 51040``（W=320），表现为 cxN
+            # 永远卡在 51040.x 不变，且 width 也只剩 0/1（标量比较），从而触发
+            # ``_draw_detection`` 把 51040 当 cx 喂给 OSD，display_x=127600
+            # 屏幕外大坐标让 K230 OSD 进入慢路径 → FPS 从 33 跌到 13。
+            #
+            # 修复：手工按行累加 ``band_slice[r]``。每行是 (W,) 1-D ndarray，
+            # 加法在 ulab 是向量化的；BAND_HEIGHT_PX=8 总共 7 次加法 ≈ 0.3ms，
+            # 比 ``axis=0`` 求和稳但开销可忽略。
+            col_sum = band_slice[0] + band_slice[1]
+            for r in range(2, self._band_h):
+                col_sum = col_sum + band_slice[r]
+
+            # 防御：万一 ulab 行为再变，立即捕获。col_sum 必须是 W 长度向量；
+            # 若是标量（len 抛 TypeError 或 != W），把整带置为无效并跳过。
+            try:
+                if len(col_sum) != self._roi_w:
+                    band.reject = "col_sum_shape"
+                    prev_valid = False
+                    prev_cx = -1.0
+                    continue
+            except TypeError:
+                band.reject = "col_sum_scalar"
+                prev_valid = False
+                prev_cx = -1.0
+                continue
+
             mass = float(np.sum(col_sum))
             band.mass = mass
             mass_total += mass
 
             # 等效宽度：col_sum 中超过阈值的列数。
-            # ulab 的比较返回 uint8/bool ndarray；同样走函数式 sum；
-            # 若该 ulab 版本不支持 bool ndarray 求和，退回 Python 计数（每带 320 次）。
+            # ulab 的比较在不同固件上可能返回 bool(1) 或 uint8(255)；
+            # 因此 sum 结果若超过 ROI 宽度，就退回 Python 计数（每带 320 次）。
             try:
                 width_mask = col_sum > self._col_sum_thr
                 band.width_px = int(np.sum(width_mask))
+                if band.width_px > self._roi_w:
+                    stats = _col_sum_stats_from_bytes(
+                        col_sum, self._roi_w, self._col_sum_thr
+                    )
+                    if stats is not None:
+                        band.width_px = stats[0]
+                    else:
+                        w = 0
+                        thr = self._col_sum_thr
+                        for v in col_sum:
+                            if _scalar_to_int(v) > thr:
+                                w += 1
+                        band.width_px = w
             except Exception:
-                w = 0
-                thr = self._col_sum_thr
-                for v in col_sum:
-                    if v > thr:
-                        w += 1
-                band.width_px = w
+                stats = _col_sum_stats_from_bytes(
+                    col_sum, self._roi_w, self._col_sum_thr
+                )
+                if stats is not None:
+                    band.width_px = stats[0]
+                else:
+                    w = 0
+                    thr = self._col_sum_thr
+                    for v in col_sum:
+                        if _scalar_to_int(v) > thr:
+                            w += 1
+                    band.width_px = w
 
             # 硬约束：mass / 宽度 / 与上一有效带的 Δcx
             if mass < self._min_mass[i]:
@@ -324,6 +441,27 @@ class LineDetector:
                 continue
 
             cx = float(np.sum(self._arange_x * col_sum) / mass)
+            # K230 ulab 还可能在 1-D 加权求和里把 col_sum 当标量广播，
+            # 表现为 cx≈sum(0..319)=51040。遇到越界值时退回按列加权求和。
+            if cx < 0.0 or cx >= float(self._roi_w):
+                stats = _col_sum_stats_from_bytes(
+                    col_sum, self._roi_w, self._col_sum_thr
+                )
+                weighted = stats[1] if stats is not None else 0.0
+                if stats is None:
+                    x = 0
+                    for v in col_sum:
+                        weighted += x * _scalar_to_int(v)
+                        x += 1
+                cx = weighted / mass
+            # cx 必须落在 ROI 列范围内；如果超出（理论上不可能，除非
+            # col_sum 又变标量），把该带置为无效，避免下游 OSD ``draw_circle``
+            # 拿到屏幕外大坐标进入 K230 image 模块慢路径，FPS 从 33 跌到 13。
+            if cx < 0.0 or cx >= float(self._roi_w):
+                band.reject = "cx_oob_%.1f" % cx
+                prev_valid = False
+                prev_cx = -1.0
+                continue
             band.cx_px = cx
 
             w = band.width_px

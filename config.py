@@ -196,24 +196,61 @@ BAND_HEIGHT_PX = 8
 BAND_TOPS_PX = (80, 116, 151, 187, 222)
 
 # ---------------------------------------------------------------------------
-# 阶段 B：L2 硬约束（plan §6.2）
+# 阶段 B：L2 硬约束（plan §6.2）—— profile 切换
 # ---------------------------------------------------------------------------
-# mass_i ≥ MIN_MASS_PER_BAND[i]：每带最小累积像素强度。bin_inv 黑线区像素 = 255，
-# 所以"完整一条 18 mm 黑线穿过 8 行带 + 在 IPM 近带占 ~20 px 宽"≈
-#   8 (rows) × 20 (cols) × 255 = 40800。设 MIN 为该名义值的 25%（10000 量级）；
-# 远带因 IPM 透视使黑线变窄，下调到 5000 量级。
-# 5 条带顺序：y_top 升序 = NEAR(180~230 区段) → FAR(80~130 区段)，索引 i 越大越近。
-MIN_MASS_PER_BAND = (4000, 5000, 6500, 8000, 10000)
+# Plan §6.2 默认阈值是按"装车后近处看到 18 mm 电工胶带的 IPM 投影"标定的：
+#   每带 mass ≈ 8 行 × 20 列 × 255 = 40800（取 25% 当 MIN ≈ 10000）；
+#   width  ≈ IPM 后近处 20 px、远处 10 px。
+# 桌面调试场景（黑色线缆 / 显示器边框 / 不装车）下黑色目标的几何完全不同：
+#   线缆直径 ~3-5 mm，圆柱中间反光只剩两条 1-2 px 的边线；ROI 内前景占比
+#   < 1%（实测 0.7%），mass / width 全部撞硬约束，V=0/5 是必然结果。
+#
+# 解决：加 ``LINE_DETECTION_PROFILE`` 在 "bench"（桌面调试，宽容）和
+# "track"（装车赛道，plan 默认）之间切换。下方 _XXX_BENCH / _XXX_TRACK
+# 是真实数值，启动时按 profile 选一组绑定到无前缀的 config 名上。
+LINE_DETECTION_PROFILE = "bench"
 
-# 等效宽度的下界/上界 (px)：col_sum > COL_SUM_THR_FOR_WIDTH 的列数。
-# IPM 后近处黑线 ~20 px、远处 ~10 px；±50% 留容差。
-W_MIN_PX_PER_BAND = (5, 6, 8, 10, 12)
-W_MAX_PX_PER_BAND = (16, 18, 22, 26, 30)
-COL_SUM_THR_FOR_WIDTH = 255          # bin_inv 中"该列有黑线像素覆盖"的最低 col_sum
+# ----- track：装车赛道默认（plan §6.2） ----- #
+_MIN_MASS_PER_BAND_TRACK = (4000, 5000, 6500, 8000, 10000)
+_W_MIN_PX_PER_BAND_TRACK = (5, 6, 8, 10, 12)
+_W_MAX_PX_PER_BAND_TRACK = (16, 18, 22, 26, 30)
+_COL_SUM_THR_FOR_WIDTH_TRACK = 255   # 严格 > ：每列至少 ≥ 2 个前景像素才计数
+
+# ----- bench：桌面调试（线缆 / 显示器边框 / 走线槽） ----- #
+# 比 track 松一个数量级；目标只是验证 detector 主干通路 + L2 硬约束没漏。
+# 数值由 0.7% 前景占比反推：89 px / 5 带 ≈ 18 px/带 → mass ≈ 4500，
+# 但实际多集中在 1-2 条带，单带 mass 可能 ~10000，其他带 < 500 → MIN 设到
+# 几百量级让"有信号的带"过、"没信号的带"挂。COL_SUM_THR=0 让单像素列也
+# 算 width；W_MIN=1 容忍线缆边线只剩 1 px。
+#
+# **几何约束（width 上限 / dcx）在 bench 直接禁用**：桌面摆放的黑线缆 / 走线槽
+# 朝向任意——水平横放时 col_sum 在 320 列都 > 0，width_px≈320；斜放时 width
+# 也轻松到 50+。这些都和 plan §6.2 假设的"装车后 IPM 投影 18 mm 胶带"完全
+# 不同，width 上限失去物理意义。把 W_MAX 全设为 ROI_W、DELTA_CX_MAX 设到大
+# 数即可让 bench 模式仅用 ``MIN_MASS_PER_BAND`` 一项做过滤，保持 detector
+# 主干（L0/L1/L2 列向求和 + cx 计算）的通路验证。
+_MIN_MASS_PER_BAND_BENCH = (300, 400, 500, 700, 900)
+_W_MIN_PX_PER_BAND_BENCH = (1, 1, 1, 1, 1)
+_W_MAX_PX_PER_BAND_BENCH = (320, 320, 320, 320, 320)   # 等同禁用宽度上限
+_COL_SUM_THR_FOR_WIDTH_BENCH = 0     # ≥ 1 个前景像素的列就计数（含 col_sum=255 单像素）
+
+# Profile 解析：默认 track 防止"装车后忘记切回去"。
+if LINE_DETECTION_PROFILE == "bench":
+    MIN_MASS_PER_BAND = _MIN_MASS_PER_BAND_BENCH
+    W_MIN_PX_PER_BAND = _W_MIN_PX_PER_BAND_BENCH
+    W_MAX_PX_PER_BAND = _W_MAX_PX_PER_BAND_BENCH
+    COL_SUM_THR_FOR_WIDTH = _COL_SUM_THR_FOR_WIDTH_BENCH
+else:
+    MIN_MASS_PER_BAND = _MIN_MASS_PER_BAND_TRACK
+    W_MIN_PX_PER_BAND = _W_MIN_PX_PER_BAND_TRACK
+    W_MAX_PX_PER_BAND = _W_MAX_PX_PER_BAND_TRACK
+    COL_SUM_THR_FOR_WIDTH = _COL_SUM_THR_FOR_WIDTH_TRACK
 
 # 相邻带 cx 跳变最大值：圆环切线斜率上限 + sensor 抖动余量。
 # 30 px / (35 px 带间距) = tan ≈ 0.86，对应 ~40°，足够容忍最严的圆切线。
-DELTA_CX_MAX_PX = 30
+# bench 模式下桌面线缆 / 走线槽朝向任意，把 dcx 上限放到 ROI 全宽，
+# 等同禁用 dcx 检查；bench 仅靠 ``MIN_MASS_PER_BAND`` 过滤每条带。
+DELTA_CX_MAX_PX = 320 if LINE_DETECTION_PROFILE == "bench" else 30
 
 # ---------------------------------------------------------------------------
 # 阶段 B：L1 形态学后端
@@ -235,10 +272,14 @@ Q_L2_W_MASS = 0.5
 Q_L2_W_CONT = 0.3
 Q_L2_W_VALID = 0.2
 
-# mass_total 名义值：5 条带的 MIN_MASS_PER_BAND 之和的 ~3 倍（即"每带都达到名义
-# 黑线密度"≈ 8 × 20 × 255 = 40800 / 带，5 条 = 204000）。取 100000 作为饱和点
-# 让常态 Q_mass ≈ 80~100。
-Q_L2_MASS_NOMINAL_TOTAL = 100000
+# mass_total 名义值：track 模式按 5 条带 × MIN_MASS_PER_BAND × 3 倍估的
+# （每带 IPM 投影下 8 × 20 × 255 = 40800，5 条饱和值 ≈ 200000）；bench
+# 模式黑线缆 ROI 占比 < 1%，整帧 mass_total 通常 5000~20000，按此放缩
+# nominal 到 10000，让 Q_mass 在桌面"看到线"时也能给出 ~70 分。
+if LINE_DETECTION_PROFILE == "bench":
+    Q_L2_MASS_NOMINAL_TOTAL = 10000
+else:
+    Q_L2_MASS_NOMINAL_TOTAL = 100000
 
 # jitter_cx 参考值：超过该值的相邻带 cx 跳变直接把 Q_cont 拉到 0。
 # 与 DELTA_CX_MAX_PX 一致（>30 已经触发硬约束剔除，参考值放在它下方更敏感）。

@@ -219,9 +219,58 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 - [ ] **阴影 / 反光抗干扰升级**：阶段 B 仅靠 L2 硬约束 + Q_L2 cont 项。
   若阴影边缘误检率 < 95%，下一步在 line_detector 里加 "上一帧 cx 邻域
   ±N px 内才纳入" 的时域 prior（不是 EMA，是空间 prior）。
-- [ ] **`ulab.bool sum`**：line_detector 的 `(col_sum > thr).sum()` 在
-  早期 ulab 上可能不返回 int，已经在代码里 try/except + Python 计数兜底；
-  若实测发现走 fallback，就改成 `np.where(col_sum > thr, 1, 0).sum()`。
+- [x] **K230 ulab bool / uint8 mask 求和语义不稳定**：line_detector 的
+  `np.sum(col_sum > thr)` 在板端可能把 True 当 `255` 而不是 `1` 求和，
+  导致 `width_px` 被放大 255 倍，桌面 bench 下即使 `W_MAX=320` 也会误触发
+  `w>320`，表现为红色 binary overlay 完整标中线缆但 `V=0/5`。修复：
+  若 `width_px > roi_w`，改走 `bytes(col_sum)` 小端解码，直接按列统计
+  `width`；仅当 `bytes()` 失败时才保留逐元素 `_scalar_to_int()` 兜底。
+- [x] **bench profile 几何上限对桌面场景失效**：cx bug 修好之后真实
+  `width_px` / `dcx` 终于算对了，桌面线缆 / 走线槽场景反而 V=0/5 全挂
+  （前几版 V=5/5 是 width 标量恒 1 的假阳性）。原因：水平 / 斜放黑线缆在
+  `band_slice` 8 行内可能贯穿整宽，col_sum 几乎全列 > 0，width_px≈320，
+  撞 bench `W_MAX=(40~80)`；线缆斜放时相邻带 cx 差 100+，撞 bench
+  `DELTA_CX_MAX=60`。
+  修复：bench profile 把 `_W_MAX_PX_PER_BAND_BENCH` 全设为 320、
+  `DELTA_CX_MAX_PX (bench)` 设到 320、`_W_MIN_PX_PER_BAND_BENCH` 全
+  设为 1。等同**bench 模式只用 `MIN_MASS_PER_BAND` 一项过滤**——此为
+  设计预期：bench 仅验证 detector 主干（L0/L1/L2 + cx 计算）通路，几何
+  约束在 track 模式才生效（plan §6.2 假设的 IPM 投影 18 mm 胶带 width）。
+- [x] **K230 ulab `np.sum(arr, axis=0)` 忽略 axis 参数**：实测对 (8, 320)
+  shape 的 ROI 切片调 `np.sum(band_slice, axis=0)`，**返回标量总和而不是
+  按列求和的 (320,) 向量**（等价 `np.sum(band_slice)`，axis 被无视）。
+  下游连锁反应：
+  1. `col_sum` 是 mass 标量；
+  2. `mass = float(np.sum(col_sum))` 还是同一个标量值，看着正常；
+  3. `cx = sum(arange_x * col_sum) / mass = scalar * sum(arange_x) / mass
+     = sum(arange_x) = 0+1+...+(W-1) = 51040.0`（W=320）；
+  4. cx_px=51040 喂给 OSD `algo_xy_to_display`，display_x=127600 严重
+     超屏，K230 image 模块 `draw_circle / draw_line` 进入慢路径，每帧
+     50ms+ → algo FPS 从 33 跌到 13；
+  5. bench profile 把 W_MIN 降到 1 才让 V=4-5 通过，bug 才暴露——track
+     profile 下 width=1 不通过 W_MIN=5 全部失败 V=0/5，cx_near_px=-1
+     不写出，bug 被掩盖。
+  修复：`vision/line_detector.process` 用手工逐行累加 `col_sum =
+  band_slice[0] + band_slice[1] + ... + band_slice[H-1]` 替代 axis sum，
+  再加两道防御 ——
+  ① `len(col_sum) != self._roi_w` 时整带置 `col_sum_shape` invalid；
+  ② cx 落到 `[0, W)` 之外时整带置 `cx_oob_*` invalid，避免污染 OSD。
+  保留 `arr.sum(axis=...)` quirk 作为 plan §15 K230 已知问题清单的一项。
+- [x] **K230 ulab 1-D 加权质心仍会广播成 `cx≈51040`**：在修复
+  `axis=0` 之后，`col_sum` 已经是长度 320 的向量，但实板仍出现
+  `cx = np.sum(arange_x * col_sum) / mass ≈ 51040`（即 `0+1+...+319`），
+  日志表现为：
+  `Q=50.0(hold) V=0/5`，`[VLT.band] ... cx_oob_51040`，同时
+  `mass_total` / `width` 都正常。修复过程：
+  1. `vision_line_tracking.py` 增加 `[VLT.band]` 低频诊断行，打印每条带
+     `mass / width / cx / reject`，避免只靠 `V=0/5` 猜硬约束；
+  2. `line_detector.process` 在 `cx` 越界时不再直接丢带，而是用
+     `_col_sum_stats_from_bytes(col_sum, roi_w, threshold)` 从 `bytes(col_sum)`
+     小端解码，计算 `weighted=Σx·col_sum[x]` 后重算 `cx`；
+  3. 早期逐元素 `_scalar_to_int(v)` 虽能修复 `cx`，但会让 FPS 从 28~30
+     暴跌到 6~7；最终改为一次 `bytes(col_sum)` 解析，保留逐元素路径只做
+     极端兜底。实测白纸 + 黑色线缆下恢复到 `V=4/5~5/5`，`cxN/cxF`
+     落回 `[0,319]` 合法范围。
 - [ ] **`tools/calibrate_photometric.py` 仅写独立 JSON**：阶段 C 接 IPM
   时把它合并进 `calib.json` 的 photometric 节，并加 schema 版本号。
 - [x] **plan §5.3 fallback 公式在 σ ≳ μ/k 时失效**：早期实现把 `μ−kσ` 钳到
@@ -294,6 +343,25 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
   3. 全 ROI 扫描共 320×150=48000 次字节索引 ≈ 2.4ms；前景率 ~1-3%
      场景下 draw_rect 调用 ~300-1000 次，OSD 总耗时 < 30ms。
   详见 `vision/camera._draw_overlay_full_dither` 与 `_draw_overlay_bands`。
+- [x] **桌面调试 V=0/5 → 加 `LINE_DETECTION_PROFILE` 双档**：用户对桌面
+  白纸上的黑色线缆做模拟时，红色 overlay 显示正确（L0/L1/L2 主干通畅），
+  但 V=0/5 全程 hold/lost。日志反推：`band_fg=89/12800 (0.7%)`，平均每带
+  18 px → mass ≈ 4500，远低于 plan §6.2 默认 `MIN_MASS_PER_BAND[i]≥4000~10000`
+  阈值；线缆圆柱中间反光只剩两条 1-2 px 边线，width 也撞 `W_MIN[i]=5..12`。
+  这正是 task_log §4 早期 TODO 提示的"装车后实测重定"场景，桌面前后不切档
+  必然 V=0。修复：
+  1. config 加 `LINE_DETECTION_PROFILE` 字符串开关，"bench" / "track" 两档；
+  2. `_MIN_MASS_PER_BAND_BENCH=(300,400,500,700,900)`、
+     `_W_MIN_PX_PER_BAND_BENCH=(1,1,1,1,1)`、
+     `_W_MAX_PX_PER_BAND_BENCH=(320,320,320,320,320)`、
+     `_COL_SUM_THR_FOR_WIDTH_BENCH=0`、
+     `DELTA_CX_MAX_PX=320`、`Q_L2_MASS_NOMINAL_TOTAL=10000`；
+     全部按 0.7%~4% 前景率与任意摆放线缆反推，让有信号的带过、没信号的带挂；
+  3. track 一组保持 plan §6.2 装车预期值不动，避免回赛道时反复改阈值；
+  4. `vision_line_tracking.main()` 启动日志多打一行 `L2 thresholds: ...`，
+     方便实测时确认当前 profile 已生效。
+  bench → track 切回时只改这一行字符串，不改其他参数。详见 `config.py`
+  顶部 ``LINE_DETECTION_PROFILE`` 区块。
 - [x] **删除 line_detector copy_from MMZ 死路径**：camera.py OSD 改走
   `bytes(binary_np)` 字节扫描后，``detection.binary_image``（MMZ 镜像）
   零消费，但 line_detector 每帧仍 `_roi_img.copy_from(src_wrap)` 做
@@ -379,3 +447,91 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
   bootstrap 兜底"。
 - **L1 后端最终选型**：装车实测后定 `LINE_L1_BACKEND` 默认值（image_open
   vs none），写进 plan errata，避免阶段 C 起继续"两套都跑"。
+
+---
+
+## 7. 日志与 OSD 字段含义速查
+
+### 7.1 主循环每 ~5 秒一行的 `[VLT] algo_fps=...` 日志
+
+来自 `vision_line_tracking.py` 主循环（按 `LOG_INTERVAL_MS` 节流，默认 5000ms）。
+单行示例：
+
+```
+[VLT] algo_fps=30.6 period=32.7ms frames=181 Q=80.0(good) V=0/5 cxN=-1.0 cxF=-1.0 thr=51 mu=88.5 sig=17.1 mem=3965696 (min=3950208 max=3966272 drift=0.4%)
+```
+
+| 字段 | 单位 | 含义 | 健康范围 |
+|---|---|---|---|
+| `algo_fps` | Hz | 算法链路（CHN1 GRAYSCALE → detector）的实测帧率，5 s 窗口平均 | 30~33（sensor 上限） |
+| `period` | ms | `1000 / algo_fps`，单帧周期 | < 33（≈ 30 FPS） |
+| `frames` | 帧 | 自启动累计算法帧数（不含丢帧） | 单调递增，无回退 |
+| `Q` | 0~100 | `Q_L2` 评分（mass + 连续性 + 有效带占比 三项加权，见 §6 / `vision/quality.py`） | 80+ 为 good |
+| `(<grade>)` | 标签 | `Q` 落点：`good ≥80 ≥ degrade ≥60 ≥ hold ≥40 ≥ lost` | good |
+| `V` | n/N | 5 条扫描带通过硬约束的数量 / 总数（`n_valid` / `BAND_COUNT`） | 4/5 ~ 5/5 |
+| `cxN` | px | **近带**（bands[-1]，y 最大）`cx_px`，黑线在算法分辨率下的横向中心列；`-1.0` = 该带无效 | `[0, ALGO_WIDTH)` 内 |
+| `cxF` | px | **远带**（bands[0]，y 最小）`cx_px`；含义同 `cxN` | 同上 |
+| `thr` | 灰度 | `photometric.threshold`，本帧 L0 二值化阈值 | bench: 50~80；track: 60~100 |
+| `mu` | 灰度 | 上次 bootstrap / 漂移重标定测得的 ROI 背景均值 `μ_bg` | 取决于环境光 |
+| `sig` | 灰度 | 同上的 `σ_bg`（背景标准差） | < μ/3 才算单峰高斯 |
+| `mem` | byte | `gc.mem_free()` 当前剩余堆 | 略波动；震荡 < 10% 为 OK |
+| `min` | byte | 启动以来 `mem_free` 的最小观察值 | 关注 drift% |
+| `max` | byte | 启动以来 `mem_free` 的最大观察值 | 同上 |
+| `drift` | % | `(max-min)/max` 内存震荡幅度，plan §12 阶段 A 验收要求 ≤ 10% | < 5% 为优 |
+
+附加可能出现的告警字段（满足触发条件才会打印）：
+
+- `[photometric] drift trigger mu_bg X -> Y (delta=Z)`：ROI 均值漂移 ≥
+  `PHOTO_DRIFT_TRIG_DELTA_MU`，启动 30 帧重标定；
+- `[photometric] drift recalib done frames=N mu_bg=... ...`：重标定收尾；
+- `[photometric] fallback rejected (mu=... sigma=... thr_fb=...) -> use Otsu only`：
+  `μ−kσ` 落到病态区（≤0 或 ≥ Otsu），降级为单 Otsu；
+- `[VLT] snapshot failed N times in a row`：连续丢帧 ≥ 10 次。
+
+### 7.2 OSD（屏幕叠加）三行文本
+
+`render_overlay()` 在 1 Hz 触发时刷新；与 §7.1 同源数据。
+
+| OSD 行 | 模板 | 字段说明 |
+|---|---|---|
+| 1 | `FPS xx.x  (T xx.x ms)` | 同 `algo_fps` / `period`；`T > FRAME_PERIOD_ALERT_MS` 时整行红 |
+| 2 | `Q xx.x  V n/N  cxN xx.x  thr nn` | 同上 4 字段；`Q < Q_HOLD` 时整行红 |
+| 3a (条件) | `PHOTO recal n/30` | 仅在 photometric 重标定中显示（红） |
+| 3b (条件) | `MEM xxx KB  (drift x.x%)` | 仅在 `drift% ≥ MEM_DRIFT_ALERT_PCT` 或 `mem < MEM_LOW_ALERT_BYTES` 时显示（红） |
+| 3c (条件) | `CAP n/N` | 仅在 `CAPTURE_ENABLE=True` 采样模式下显示 |
+
+### 7.3 `[camera.dbg] binary` 调试行（启动后前 ~10 帧打印）
+
+```
+[camera.dbg] binary thr=53 band_fg=80/12800 (0.6%) mode=full_dither_12 preview=0 overlay=247
+```
+
+| 字段 | 含义 |
+|---|---|
+| `thr` | 当前 L0 阈值（同上 `thr`） |
+| `band_fg / total` | 5 条带共 `BAND_COUNT × BAND_HEIGHT_PX × ROI_W` 像素中前景数（`mass_total / 255`） |
+| `(x.x%)` | 前景占比；装车后正常黑线场景应 1~5% |
+| `mode` | `OSD_BINARY_OVERLAY_MODE` 实际生效值（`bands_only` / `full_solid` / `full_dither_50/25/12`） |
+| `preview` | 右上角预览窗本帧画的 OSD 矩形数（`DEBUG_SHOW_BINARY_PREVIEW=False` 时恒为 0） |
+| `overlay` | 主画面 ROI 红色高亮本帧画的 OSD 矩形数 |
+
+### 7.4 启动期一次性日志
+
+```
+[VLT] vision_line_tracking start, config=phaseB-0.1, debug=True, profile=bench
+[VLT] L2 thresholds: MIN_MASS=(...) W=[(...)..(...)] COL_THR=0 Δcx_max=60
+[camera] binary overlay setup: overlay=True preview=False mode=full_dither_12 ...
+[camera] request: sensor=1280x720@60, display→CHN0=YUV420SP, algo→CHN1=GRAYSCALE
+[camera] CHN0 (display): 800x480
+[camera] CHN1 (algo   ): 320x240
+[photometric] bootstrap done frames=30 mu_bg=... sigma_bg=... thr_otsu=... threshold=...
+```
+
+| 字段 | 含义 |
+|---|---|
+| `config=phaseB-0.1` | `CONFIG_VERSION`，配置 schema 版本号 |
+| `profile=bench/track` | `LINE_DETECTION_PROFILE`：硬约束阈值组（见 §4 桌面 vs 装车切档说明） |
+| `MIN_MASS / W / COL_THR / Δcx_max` | 当前 profile 实际生效的 L2 硬约束值 |
+| `binary overlay setup` | OSD 二值调试初始化：是否启用、模式、ROI 几何参数 |
+| `display→CHN0 / algo→CHN1` | 双通道格式：`OSD_PIXFORMAT` / `ALGO_PIXFORMAT` |
+| `bootstrap done` | photometric 30 帧自适应初标定结果（`μ_bg / σ_bg / Otsu / 最终 threshold`） |
