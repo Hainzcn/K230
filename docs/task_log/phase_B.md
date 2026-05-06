@@ -3,7 +3,8 @@
 > 对照计划：`docs/vision_line_tracking_plan_v2.md` §12 阶段 B
 > 起止：2026-05-04 ~
 > 负责人：—
-> 当前状态：**代码完成；性能 + 验收实测待物理装配后回填**
+> 当前状态：**代码完成（CONFIG_VERSION=phaseB-0.2，含段查找抗干扰升级）；
+> 反光问题决策：硬件侧加偏振片（不进软件预算）；性能 + 验收实测待物理装配后回填**
 
 ---
 
@@ -29,14 +30,14 @@
 
 ```
 K230/
-├── config.py                          # CONFIG_VERSION 升 phaseB-0.1
+├── config.py                          # CONFIG_VERSION=phaseB-0.2（段查找/prior 参数）
 ├── tools/
 │   └── calibrate_photometric.py       # 30 帧 Otsu 标定脚本
 ├── vision/
 │   ├── __init__.py                    # __all__ 加 photometric / line_detector / quality
 │   ├── camera.py                      # render_overlay(lines, detection=)，增 _draw_detection / algo_xy_to_display
 │   ├── photometric.py                 # Photometric (阈值 + 漂移监测)
-│   ├── line_detector.py               # LineDetector (L0+L1+L2)
+│   ├── line_detector.py               # LineDetector (L0+L1+L2 段查找+时空 prior)
 │   └── quality.py                     # compute_q_l2 / grade
 ├── vision_line_tracking.py            # 装配 photometric + detector
 └── docs/task_log/phase_B.md           # 本文件
@@ -44,7 +45,7 @@ K230/
 
 ### 2.2 核心设计点
 
-#### 2.2.1 算法主路径
+#### 2.2.1 算法主路径（phaseB-0.2 段选择版）
 
 ```text
 snapshot CHN1 (320×240 GRAY)
@@ -52,14 +53,24 @@ snapshot CHN1 (320×240 GRAY)
         ├─► bin_raw   (黑线=0  背景=255)
         └─► bin_inv = 255 − bin_raw_roi   (仅 ROI 行；前景=255)
               └─► (LINE_L1_BACKEND=image_open) image.Image(ALLOC_REF) → open(1)   # L1
-                    └─► 5 条扫描带 ulab 切片 + col_sum(axis=0)                  # L2
-                          ├─► mass / cx / width
-                          └─► 硬约束（mass / W / Δcx）→ BandResult
-                                └─► quality.compute_q_l2 (mass + cont + valid)
+                    └─► 5 条扫描带 ulab 切片 + 手工逐行加 → col_sum  # L2.a
+                          └─► bytes(col_sum) 一次解码 → col_vals (Python int) # L2.b
+                                └─► _find_runs(>COL_SUM_THR, gap_tol)         # L2.c
+                                      └─► 候选筛选（MIN_MASS[i]、W_MIN/MAX[i]）# L2.d
+                                            └─► _select_best_run：           # L2.e
+                                                  1) 时域 prior（cx_prev ± radius，最近）
+                                                  2) 空间 prior（neighbor_cx ± Δcx，最近）
+                                                  3) mass 兜底
+                                                  └─► BandResult.{cx_px,width_px,mass,valid}
+                                                        └─► quality.compute_q_l2
 ```
 
 每帧调用一次 `LineDetector.process(img, threshold)`，返回内部复用的
 `DetectionResult`，避免帧循环 alloc（plan §9.2 守则 5）。
+
+**选段传播方向**：`bands[-1]` (NEAR) → `bands[0]` (FAR)，逐带把刚选中的
+cx 作为下一带的"空间 prior 中心"。NEAR 是 e_y 主源、置信最高（plan §4.3），
+先选定后给 MID/FAR 提供锚点；NEAR 失败时下一带退化到只用时域 prior。
 
 #### 2.2.2 极性约定（黑线 = 前景 = 255）
 
@@ -96,18 +107,23 @@ snapshot CHN1 (320×240 GRAY)
 带索引约定：i=0 是最远带，i=BAND_COUNT-1 是最近带。`bands[-1]` 永远
 是近带，与 plan §4.3 权重 0.5/0.3/0.2 的概念匹配（融合在阶段 C 才落地）。
 
-#### 2.2.5 L2 硬约束（plan §6.2）
+#### 2.2.5 L2 硬约束 + 选段 prior（plan §6.2 / phaseB-0.2）
 
-每条带独立判定，单带不合格 → 仅剔除该带，不丢整帧：
+phaseB-0.2 起，下表三道约束从"事后剔除"挪到"段查找后的候选过滤"——
+干扰段在选段阶段就被排除，不再"先污染全列质心 cx 再剔除整带"。
 
-| 约束 | 配置项 | 默认（远→近） |
-|------|--------|----------------|
-| `mass_i ≥ MIN` | `MIN_MASS_PER_BAND` | 4000 / 5000 / 6500 / 8000 / 10000 |
-| `W_MIN ≤ width ≤ W_MAX` | `W_MIN/MAX_PX_PER_BAND` | (5,16) / (6,18) / (8,22) / (10,26) / (12,30) |
-| `\|Δcx\| ≤ DELTA_CX_MAX_PX` | `DELTA_CX_MAX_PX` | 30 |
+| 约束 | 配置项 | track 默认（远→近） | bench 默认 | 角色 |
+|------|--------|---------------------|------------|------|
+| `mass_seg ≥ MIN` | `MIN_MASS_PER_BAND` | 4000/5000/6500/8000/10000 | 300/400/500/700/900 | 候选硬筛 |
+| `W_MIN ≤ width_seg ≤ W_MAX` | `W_MIN/MAX_PX_PER_BAND` | (5,16)/(6,18)/(8,22)/(10,26)/(12,30) | (1,320) | 候选硬筛 |
+| `\|cx - prev_cx\| ≤ radius` | `LINE_CX_PRIOR_RADIUS_PX` | 30 | 320 | 时域 prior 排序 |
+| `\|cx - neighbor_cx\| ≤ Δcx_max` | `DELTA_CX_MAX_PX` | 30 | 320 | 空间 prior 排序 |
+| `gap_tol` | `LINE_RUN_GAP_TOLERANCE_PX` | 1 | 1 | 段桥接（防 sensor 噪声断段） |
 
 宽度近大远小是 IPM 透视下的经验值，装车后实测要校对。`Δcx` 阈值 30 对
-35 px 带间距 ≈ tan 40°，足够容忍最严的圆切线 + sensor 抖动。
+35 px 带间距 ≈ tan 40°，足够容忍最严的圆切线 + sensor 抖动。bench 模式
+把 W_MAX / Δcx_max / prior_radius 全设到 ROI 全宽，等同只靠 MIN_MASS 一项
+过滤——验证 detector 主干通路用，**装车前必须切回 track**。
 
 #### 2.2.6 Q_L2 评分（plan §6.6 子集）
 
@@ -169,10 +185,13 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 
 ### 2.3 与阶段 A 的差异
 
-| 维度 | 阶段 A | 阶段 B |
-|------|--------|--------|
-| 算法层数 | 仅 snapshot | L0 + L1 + L2 + Q_L2 |
+| 维度 | 阶段 A | 阶段 B (phaseB-0.2) |
+|------|--------|---------------------|
+| 算法层数 | 仅 snapshot | L0 + L1 + L2 (段查找+选段) + Q_L2 |
 | 阈值来源 | 无 | 30 帧 Otsu bootstrap + 1 s 漂移监测 |
+| cx 来源 | — | 段查找选段（vs phaseB-0.1 的全列加权质心） |
+| 抗干扰 | — | 几何筛 + 时域 prior + 空间 prior + mass 兜底 |
+| 反光处理 | — | **硬件**：镜头偏振片（不进软件预算） |
 | OSD | FPS / period / mem | + 5 条扫描带 / cx 圆点 / 宽度 / Q / recal |
 | 主循环步数 | 1 (snapshot) | 4 (snapshot → photometric.update → detector.process → render) |
 | 帧预算 (plan §9.1 v2.1) | snapshot ~30 ms (硬上限) | snapshot ~30 ms + 算法 ≤ 17 ms |
@@ -216,9 +235,44 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 - [ ] **W_MIN/W_MAX 的远近差异**：(5,16)~(12,30) 是按 IPM 透视 + 黑线
   18 mm 的粗估，装车后要在样张上量 5 条带的实际 width 像素，回填
   `W_MIN_PX_PER_BAND` / `W_MAX_PX_PER_BAND`。
-- [ ] **阴影 / 反光抗干扰升级**：阶段 B 仅靠 L2 硬约束 + Q_L2 cont 项。
-  若阴影边缘误检率 < 95%，下一步在 line_detector 里加 "上一帧 cx 邻域
-  ±N px 内才纳入" 的时域 prior（不是 EMA，是空间 prior）。
+- [x] **阴影 / 反光抗干扰升级**：phaseB-0.2 升级 L2 数据流为"段查找 +
+  时空 prior 选段"。
+  - **反光**：电气胶带表面镜面反光会让二值图中线被打洞，老的
+    "全列加权质心" cx 会偏向非反光那一侧。决策：**反光问题在硬件侧解决**
+    （镜头加偏振片，把镜面反射的线偏振光过滤掉），软件侧不引入 close /
+    Sobel / 边缘对等额外开销。
+  - **干扰物体**：旧 cx 公式 `cx = Σx·col_sum / Σcol_sum` 是全列加权
+    质心，ROI 只要出现"另一块黑"就会按质量加权拉偏（例如黑线在 x=180、
+    路面碎屑在 x=50，cx 跑到 110，控制律按它跟踪相当于直接撞过去）。
+    DELTA_CX_MAX_PX 事后剔除只在干扰只染部分带时有效；干扰沿黑线方向
+    平行延展时会同时拉偏 5 条带的 cx，硬约束完全沉默。
+  - **新数据流**（vision/line_detector.py）：
+    1. 列向求和 col_sum 不变；
+    2. `_decode_col_sum_bytes` 一次 `bytes(col_sum)` 解码成 Python int
+       list（绕开 K230 ulab 的 axis sum / 加权 sum quirk）；
+    3. `_find_runs` 在 col_vals 上找所有 `> COL_SUM_THR_FOR_WIDTH` 的
+       连续段，允许 `LINE_RUN_GAP_TOLERANCE_PX` 列的窄洞被桥接（防 sensor
+       噪声把单段断成两段）；
+    4. `_select_best_run` 候选筛选：`MIN_MASS[i] ≤ mass_seg` 且
+       `W_MIN[i] ≤ width ≤ W_MAX[i]`——把 plan §6.2 的三道硬约束从
+       事后剔除挪到选段前过滤；
+    5. 选段优先级：(a) 时域 prior（与上一帧本带 cx 距离最小，半径
+       `LINE_CX_PRIOR_RADIUS_PX`）→ (b) 空间 prior（与 NEAR→FAR 传播链
+       中上一带刚选中的 cx 距离最小，半径 `DELTA_CX_MAX_PX`）→ (c) mass
+       最大兜底；
+    6. NEAR→FAR 传播：从 bands[-1] 反向遍历到 bands[0]，因为 NEAR 是 e_y
+       主源、置信最高（plan §4.3）。
+  - **跨帧状态**：BandResult 新增 `cx_prev` / `cx_prev_age`，每带独立维护；
+    超过 `LINE_CX_PRIOR_AGE_MAX_FRAMES`（默认 5 帧 ≈ 167 ms）视为过期。
+    snapshot 失败 / L0 失败时调 `_decay_priors_all` 让 prior 不卡在
+    陈旧位置。
+  - **DELTA_CX_MAX_PX 语义变更**：旧版是事后剔除，新版改成"空间 prior
+    半径"——干扰段在选段阶段就被排除，不再"先污染 cx 再剔除"。同一个
+    数值，更早起作用。
+  - **预算**：5 带 × (decode 32μs + find_runs 30μs + select 5μs) ≈ 0.35ms
+    总计，远低于 plan §9.1 的 17ms 算法预算。
+  - **CONFIG_VERSION 升 phaseB-0.2**：BandResult slot 接口扩展 +
+    DELTA_CX_MAX_PX 语义变更属于 detector 接口级变化（plan §11.2）。
 - [x] **K230 ulab bool / uint8 mask 求和语义不稳定**：line_detector 的
   `np.sum(col_sum > thr)` 在板端可能把 True 当 `255` 而不是 `1` 求和，
   导致 `width_px` 被放大 255 倍，桌面 bench 下即使 `W_MAX=320` 也会误触发
@@ -426,7 +480,10 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
    作为阶段 C 的回归对照；
 3. 把实测后的 `MIN_MASS_PER_BAND` / `W_MIN/MAX_PX_PER_BAND` /
    `Q_L2_MASS_NOMINAL_TOTAL` 写回 `config.py` 并 commit，CONFIG_VERSION
-   保持 `phaseB-0.1` 不变（不破坏接口，只调参）。
+   保持 `phaseB-0.2` 不变（仅调参，不破坏接口）；
+4. **偏振片到位实测**：装上偏振片后采一段"反光最严重场景"（顶光下电气
+   胶带 + 黑色烤漆面板）的 200 帧，确认线宽连续性 ≥ 95%（与未装偏振片
+   样本对照），否则要回到软件方案补 close 形态学。
 
 ---
 
@@ -518,8 +575,9 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 ### 7.4 启动期一次性日志
 
 ```
-[VLT] vision_line_tracking start, config=phaseB-0.1, debug=True, profile=bench
-[VLT] L2 thresholds: MIN_MASS=(...) W=[(...)..(...)] COL_THR=0 Δcx_max=60
+[VLT] vision_line_tracking start, config=phaseB-0.2, debug=True, profile=bench
+[VLT] L2 thresholds: MIN_MASS=(...) W=[(...)..(...)] COL_THR=0 Δcx_max=320
+[VLT] L2 segment select: gap_tol=1 prior_radius=320.0 prior_age_max=5
 [camera] binary overlay setup: overlay=True preview=False mode=full_dither_12 ...
 [camera] request: sensor=1280x720@60, display→CHN0=YUV420SP, algo→CHN1=GRAYSCALE
 [camera] CHN0 (display): 800x480
@@ -529,9 +587,12 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 
 | 字段 | 含义 |
 |---|---|
-| `config=phaseB-0.1` | `CONFIG_VERSION`，配置 schema 版本号 |
+| `config=phaseB-0.2` | `CONFIG_VERSION`，配置 schema 版本号 |
 | `profile=bench/track` | `LINE_DETECTION_PROFILE`：硬约束阈值组（见 §4 桌面 vs 装车切档说明） |
-| `MIN_MASS / W / COL_THR / Δcx_max` | 当前 profile 实际生效的 L2 硬约束值 |
+| `MIN_MASS / W / COL_THR / Δcx_max` | 当前 profile 实际生效的 L2 硬约束值。`Δcx_max` 在 phaseB-0.2 起兼任"段选择空间 prior 半径"（NEAR→FAR 传播链中上一带 cx 邻域），不仅是事后剔除阈值。 |
+| `gap_tol` | `LINE_RUN_GAP_TOLERANCE_PX`：连续段查找时允许桥接的窄洞列数（防 sensor 噪声断段） |
+| `prior_radius` | `LINE_CX_PRIOR_RADIUS_PX`：时域 prior 半径——本帧候选段必须落在"上一帧本带 cx ± radius"内才参与时域排序，半径外回退到空间 prior |
+| `prior_age_max` | `LINE_CX_PRIOR_AGE_MAX_FRAMES`：时域 prior 失效阈值；连续 N 帧无效后丢弃 cx_prev |
 | `binary overlay setup` | OSD 二值调试初始化：是否启用、模式、ROI 几何参数 |
 | `display→CHN0 / algo→CHN1` | 双通道格式：`OSD_PIXFORMAT` / `ALGO_PIXFORMAT` |
 | `bootstrap done` | photometric 30 帧自适应初标定结果（`μ_bg / σ_bg / Otsu / 最终 threshold`） |

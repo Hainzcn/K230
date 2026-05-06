@@ -94,6 +94,12 @@ def main():
            config.W_MIN_PX_PER_BAND, config.W_MAX_PX_PER_BAND,
            config.COL_SUM_THR_FOR_WIDTH, config.DELTA_CX_MAX_PX)
     )
+    print(
+        "[VLT] L2 segment select: gap_tol=%d prior_radius=%.1f prior_age_max=%d"
+        % (config.get("LINE_RUN_GAP_TOLERANCE_PX", 0),
+           config.get("LINE_CX_PRIOR_RADIUS_PX", config.DELTA_CX_MAX_PX),
+           config.get("LINE_CX_PRIOR_AGE_MAX_FRAMES", 5))
+    )
 
     if config.GC_THRESHOLD_BYTES > 0:
         try:

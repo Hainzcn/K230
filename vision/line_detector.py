@@ -1,4 +1,4 @@
-"""黑线检测主流水线（plan §6.1 L0 + L1 + L2）。
+"""黑线检测主流水线（plan §6.1 L0 + L1 + L2，phaseB-0.2 段选择版）。
 
 数据流（一帧）::
 
@@ -7,10 +7,16 @@
             ├─► bin_raw  shape=(H, W) uint8，黑线=0 背景=255
             └─► bin_inv = 255 − bin_raw_roi                       # 反相，前景=255
                   └─► (可选) image.Image(ALLOC_REF) → open(1)    # L1
-                        └─► 5 条扫描带 ulab 切片 + 列向量求和    # L2
-                              ├─► col_sum / mass / cx / width
-                              └─► 硬约束过滤 → BandResult
-                                    └─► Q_L2 由 vision.quality 计算
+                        └─► 5 条扫描带 ulab 切片 + 列向量求和    # L2.a
+                              └─► col_sum (W,) → bytes 一次解码 # L2.b
+                                    └─► find_runs(>thr,gap_tol)  # L2.c
+                                          └─► 候选筛选 (W/MASS)  # L2.d
+                                                └─► 选段排序：    # L2.e
+                                                    1. 时域 prior
+                                                    2. 空间 prior
+                                                    3. mass 兜底
+                                                    └─► BandResult
+                                                          └─► Q_L2
 
 设计要点：
 
@@ -18,17 +24,25 @@
   对暗黑线会输出 0。我们要 "黑线 = 前景 = 255" 才能直接对列求和拿到密度，
   所以做一次 ``bin_inv = 255 − bin_raw_roi``（仅在 ROI 上做，省一半开销）。
 
-- L1 双后端（plan + 用户选择）：
-  - ``"image_open"``：把 ``bin_inv_roi`` 通过 ``image.Image(ALLOC_REF)`` 零拷贝
-    包装后调 ``img.open(1)``（OpenMV 原生 erode+dilate，3×3/1 iter）。
-  - ``"none"``：跳过形态学，仅靠 L2 硬约束去噪。
+- L1 双后端：
+  - ``"image_open"``：``image.Image(ALLOC_REF)`` 包装后调 ``img.open(1)``
+    （OpenMV 原生 erode+dilate，3×3/1 iter）。
+  - ``"none"``：跳过形态学，仅靠 L2 段筛选去噪。
   通过 ``config.LINE_L1_BACKEND`` 切换；运行期不动态切换。
 
-- L2 全部走 ``ulab.numpy`` 向量化，禁止逐像素 Python 循环（plan §9.2 守则 3）。
-  ``arange_x`` 在 ``__init__`` 预创建为浮点 ndarray，每帧只做切片 + sum + 标量运算。
+- **L2 段选择（phaseB-0.2 起）**：旧实现是 ``cx = Σ x·col_sum / Σ col_sum``
+  全列加权质心——ROI 出现"另一块黑"（路面碎屑 / 阴影 / 桌面异色）会被
+  按质量加权拉偏，控制律失稳。新实现把 col_sum 切成连续段（>阈值的列
+  簇），按几何 + 时域 + 空间三道 prior 选最贴合"上一帧那条线"的段，干扰
+  段在选段阶段就被排除，不污染 cx。
 
-- 带索引约定：i=0 是 y_top 最小（最远处），i=BAND_COUNT-1 是 y_top 最大（最近处）。
-  这样 ``bands[-1]`` 永远是近带，在 e_y 里权重最高（plan §4.3）。
+- L2 全部走 ``bytes(col_sum)`` 一次物化后扫描（plan §9.2 守则 3）。
+  ulab 在 K230 上的 ``np.sum(axis=...)`` / 加权求和有标量广播 quirk
+  （详见 task_log §4 已知问题），我们直接绕开。
+
+- 带索引约定：i=0 是 y_top 最小（最远处），i=BAND_COUNT-1 是 y_top 最大
+  （最近处）。``bands[-1]`` 永远是近带；选段传播按 NEAR→FAR（``range(N-1, -1, -1)``）
+  的顺序进行，因为 NEAR 是 e_y 主源、置信最高（plan §4.3）。
 """
 
 import image
@@ -40,34 +54,6 @@ from vision.interrupts import reraise_if_stop
 from vision.quality import compute_q_l2
 
 
-def _scalar_to_int(v):
-    """把 K230 ulab 迭代出的标量转成 Python int。
-
-    部分固件上 ``for v in ndarray`` 会给出普通数字；也有固件会给出
-    ``'\x00\x00'`` 这类 2 字节小端字符串。这里统一解成整数。
-    """
-    try:
-        return int(v)
-    except Exception:
-        pass
-    if isinstance(v, str):
-        n = 0
-        shift = 0
-        for ch in v:
-            n += ord(ch) << shift
-            shift += 8
-        return n
-    try:
-        n = 0
-        shift = 0
-        for b in v:
-            n += int(b) << shift
-            shift += 8
-        return n
-    except Exception:
-        return 0
-
-
 def _byte_to_int(b):
     """MicroPython / CPython 兼容地读取 bytes 单项。"""
     if isinstance(b, int):
@@ -75,11 +61,13 @@ def _byte_to_int(b):
     return ord(b)
 
 
-def _col_sum_stats_from_bytes(col_sum, roi_w, threshold):
-    """用原始 bytes 快速计算 col_sum 的 width 与加权和。
+def _decode_col_sum_bytes(col_sum, roi_w):
+    """把 col_sum 通过 ``bytes()`` 解码为长度 ``roi_w`` 的 Python int 列表。
 
-    K230 上直接迭代 ulab 标量会产出 ``'\x00\x00'``，逐点转换很慢；bytes()
-    后按小端整数解码，能避免每列一次异常。
+    K230 ulab 上 col_sum 是 uint8 行的累加结果，dtype 升级为 int16/uint16，
+    每列在 bytes 里占 ``stride = len(raw) // roi_w`` 字节，小端解码。
+
+    返回 ``None`` 表示解码失败（罕见，仅在 ulab 行为再变时触发）。
     """
     try:
         raw = bytes(col_sum)
@@ -92,8 +80,7 @@ def _col_sum_stats_from_bytes(col_sum, roi_w, threshold):
     if stride <= 0:
         return None
 
-    width = 0
-    weighted = 0.0
+    vals = [0] * roi_w
     off = 0
     for x in range(roi_w):
         v = 0
@@ -103,16 +90,168 @@ def _col_sum_stats_from_bytes(col_sum, roi_w, threshold):
             v += _byte_to_int(raw[off]) << shift
             shift += 8
             off += 1
+        vals[x] = v
+    return vals
+
+
+def _find_runs(col_vals, threshold, gap_tol):
+    """在 1-D ``col_vals`` 上找所有 ``v > threshold`` 的连续段。
+
+    允许 ``gap_tol`` 列以内的"低于阈值"被桥接到同一段，避免 sensor 噪声 /
+    抗锯齿把单段断成多段。返回 list[(x_left, x_right_excl, mass, weighted)]。
+
+    - ``mass = Σ v``，仅累加段内（含被桥接的窄洞列，让 cx 还原回真实质心）。
+    - ``weighted = Σ x · v``，与 mass 配对算 ``cx = weighted / mass``。
+    - ``x_right_excl - x_left = width_px``（段宽度，含桥接列）。
+
+    复杂度 O(W)；W=320, gap_tol=1 时实测每带 < 0.2 ms。
+    """
+    runs = []
+    if not col_vals:
+        return runs
+
+    n = len(col_vals)
+    in_run = False
+    run_start = 0
+    run_mass = 0
+    run_weighted = 0
+    last_above_x = -1
+    pending_mass = 0
+    pending_weighted = 0
+    gap_count = 0
+
+    for x in range(n):
+        v = col_vals[x]
         if v > threshold:
-            width += 1
-        weighted += x * v
-    return width, weighted
+            if not in_run:
+                in_run = True
+                run_start = x
+                run_mass = 0
+                run_weighted = 0
+                pending_mass = 0
+                pending_weighted = 0
+                gap_count = 0
+            else:
+                run_mass += pending_mass
+                run_weighted += pending_weighted
+                pending_mass = 0
+                pending_weighted = 0
+                gap_count = 0
+            run_mass += v
+            run_weighted += x * v
+            last_above_x = x
+        else:
+            if in_run:
+                pending_mass += v
+                pending_weighted += x * v
+                gap_count += 1
+                if gap_count > gap_tol:
+                    runs.append(
+                        (run_start, last_above_x + 1, run_mass, run_weighted)
+                    )
+                    in_run = False
+                    pending_mass = 0
+                    pending_weighted = 0
+                    gap_count = 0
+
+    if in_run:
+        runs.append(
+            (run_start, last_above_x + 1, run_mass, run_weighted)
+        )
+    return runs
+
+
+def _select_best_run(runs, min_mass, w_min, w_max,
+                     prev_cx, neighbor_cx, prior_radius, dcx_max):
+    """从候选段里按"几何 + 时域 + 空间 + mass"四道筛选选最优段。
+
+    :param runs:       :func:`_find_runs` 返回的 (x_l, x_r, mass, weighted) 列表
+    :param min_mass:   该带的 ``MIN_MASS_PER_BAND[i]``
+    :param w_min/max:  该带的 ``W_MIN/MAX_PX_PER_BAND[i]``
+    :param prev_cx:    上一帧本带选中的 cx（``-1`` 表示无 / 已过期）
+    :param neighbor_cx: NEAR→FAR 传播链中上一带本帧选中的 cx（``-1`` 表示无）
+    :param prior_radius: 时域 prior 半径（``LINE_CX_PRIOR_RADIUS_PX``）
+    :param dcx_max:    空间 prior 半径（``DELTA_CX_MAX_PX``）
+
+    :return: 选中的 ``(x_l, x_r, mass, weighted, cx, width)`` 元组；
+             无候选返回 ``None``。元组里把 ``cx`` 与 ``width`` 一并算好，
+             调用方不再除一次法。
+
+    选段优先级（前一档命中即返回）：
+
+    1. **时域 prior**：``|cx - prev_cx| ≤ prior_radius`` 的候选里取距离最小者。
+       ``prev_cx < 0`` 跳过该档。
+    2. **空间 prior**：``|cx - neighbor_cx| ≤ dcx_max`` 的候选里取距离最小者。
+       ``neighbor_cx < 0`` 跳过该档（NEAR 第一带或前面带未选中时）。
+    3. **mass 兜底**：取剩余候选中 ``mass`` 最大者。
+
+    几何 + mass 是硬筛（在 1 之前先过一遍），不满足直接出局——这就是把
+    plan §6.2 的 ``MIN_MASS / W_MIN / W_MAX`` 三道硬约束从"事后剔除"
+    挪到"选段前候选过滤"，让干扰段在选段阶段就消失，不污染 cx。
+    """
+    if not runs:
+        return None
+
+    candidates = []
+    for r in runs:
+        x_l, x_r, mass, weighted = r
+        w = x_r - x_l
+        if w < w_min or w > w_max:
+            continue
+        if mass < min_mass:
+            continue
+        cx = weighted / float(mass)
+        candidates.append((r, cx, w, mass))
+
+    if not candidates:
+        return None
+
+    if prev_cx >= 0.0:
+        best = None
+        best_d = prior_radius + 1.0
+        for c in candidates:
+            d = c[1] - prev_cx
+            if d < 0.0:
+                d = -d
+            if d <= prior_radius and d < best_d:
+                best = c
+                best_d = d
+        if best is not None:
+            r, cx, w, mass = best
+            return (r[0], r[1], r[2], r[3], cx, w)
+
+    if neighbor_cx >= 0.0:
+        best = None
+        best_d = dcx_max + 1.0
+        for c in candidates:
+            d = c[1] - neighbor_cx
+            if d < 0.0:
+                d = -d
+            if d <= dcx_max and d < best_d:
+                best = c
+                best_d = d
+        if best is not None:
+            r, cx, w, mass = best
+            return (r[0], r[1], r[2], r[3], cx, w)
+
+    best = candidates[0]
+    for c in candidates[1:]:
+        if c[3] > best[3]:
+            best = c
+    r, cx, w, mass = best
+    return (r[0], r[1], r[2], r[3], cx, w)
 
 
 class BandResult:
     """单条扫描带的检测结果。
 
     所有像素坐标都在算法分辨率（``ALGO_WIDTH × ALGO_HEIGHT``）下。
+
+    phaseB-0.2 起新增 ``cx_prev`` / ``cx_prev_age`` 用于时域 prior：
+    - ``cx_prev``：上一帧本带选中的 cx（无效时 ``-1.0``）
+    - ``cx_prev_age``：自 ``cx_prev`` 设值以来连续无效的帧数；超过
+      ``LINE_CX_PRIOR_AGE_MAX_FRAMES`` 即视为过期，不再参与本帧选段。
+      这两个字段由 :class:`LineDetector` 跨帧维护，OSD / quality 不消费。
     """
 
     __slots__ = (
@@ -124,6 +263,8 @@ class BandResult:
         "width_px",
         "valid",
         "reject",
+        "cx_prev",
+        "cx_prev_age",
     )
 
     def __init__(self, idx, y_top, y_bot):
@@ -135,6 +276,8 @@ class BandResult:
         self.width_px = 0
         self.valid = False
         self.reject = ""
+        self.cx_prev = -1.0
+        self.cx_prev_age = 0
 
     def __repr__(self):
         return (
@@ -165,8 +308,8 @@ class DetectionResult:
       backed image 做 ``draw_image`` source；新路径 OSD 走 ``bytes(binary_np)``
       字节扫描，已删除 MMZ 镜像，本字段恒为 None，仅保留以兼容外部读者。
     - ``q_l2`` (float)             ：仅用 L2 子项的 Q 评分（0~100）
-    - ``mass_total`` (float)       ：5 条带 mass 之和
-    - ``n_valid`` (int)            ：通过硬约束的带数
+    - ``mass_total`` (float)       ：5 条带选中段 mass 之和
+    - ``n_valid`` (int)            ：通过段筛选 + prior 选中的带数
     - ``cx_near_px`` (float)       ：最近带的 cx；若无效返回 -1
     - ``cx_far_px`` (float)        ：最远带的 cx；若无效返回 -1
     - ``threshold_used`` (int)     ：本次 L0 用的阈值（光度漂移诊断）
@@ -197,22 +340,22 @@ class DetectionResult:
 
 
 class LineDetector:
-    """L0 + L1 + L2 流水线。
+    """L0 + L1 + L2 流水线（phaseB-0.2 段选择版）。
 
-    构造期：从 ``config`` 读取所有参数，预创建 arange ndarray 与 ROI 切片元数据，
-    主循环 ``process(img, threshold)`` 不再创建可复用对象（plan §9.2 守则 5）。
+    构造期：从 ``config`` 读取所有参数，预创建 ROI 切片元数据；主循环
+    ``process(img, threshold)`` 不再创建可复用对象（plan §9.2 守则 5）。
+
+    跨帧状态：每条 ``BandResult`` 持有 ``cx_prev`` / ``cx_prev_age``，
+    供下一帧的时域 prior 使用；其余状态全部一次性。
     """
 
     def __init__(self, cfg=None):
         self.cfg = cfg if cfg is not None else config
         self.W = self.cfg.ALGO_WIDTH
         self.H = self.cfg.ALGO_HEIGHT
-        # cv_lite image_shape 顺序为 [H, W]
         self._image_shape = [self.H, self.W]
 
         roi_x, roi_y, roi_w, roi_h = self.cfg.ROI_TOTAL_PX
-        # 阶段 B 假设 ROI x 起点为 0、宽度等于 ALGO_WIDTH（plan §4.3 列等高网格）。
-        # 万一以后改成左右梯形掩膜，此处再扩。
         if roi_x != 0 or roi_w != self.W:
             print(
                 "[line_detector] WARN: ROI_TOTAL_PX x/w mismatch (%d, %d) "
@@ -232,7 +375,6 @@ class LineDetector:
                 "BAND_TOPS_PX length %d != BAND_COUNT %d"
                 % (len(self._band_tops), self._band_count)
             )
-        # ROI 内的相对 y_top（用于切片 bin_inv_roi）
         self._band_tops_rel = [t - self._roi_y for t in self._band_tops]
         for i, t in enumerate(self._band_tops_rel):
             if t < 0 or t + self._band_h > self._roi_h:
@@ -255,28 +397,32 @@ class LineDetector:
                     % (name, len(arr), self._band_count)
                 )
 
-        self._delta_cx_max = self.cfg.DELTA_CX_MAX_PX
+        self._delta_cx_max = float(self.cfg.DELTA_CX_MAX_PX)
         self._col_sum_thr = self.cfg.COL_SUM_THR_FOR_WIDTH
         self._l1_backend = self.cfg.LINE_L1_BACKEND
 
-        # 预创建 arange，避免帧循环 alloc。强制为浮点防止后续乘法 dtype 升级抖动。
-        self._arange_x = np.arange(self.W) * 1.0
-        # K230 实板一旦发现 ulab 的 bool sum / 加权 sum 语义异常，就切到
-        # bytes(col_sum) 解析；避免之后每条带都先走一次已知会失败的 ulab 路径。
-        self._prefer_bytes_col_stats = False
+        self._gap_tol = int(self.cfg.get("LINE_RUN_GAP_TOLERANCE_PX", 0))
+        if self._gap_tol < 0:
+            self._gap_tol = 0
+        self._prior_radius = float(
+            self.cfg.get("LINE_CX_PRIOR_RADIUS_PX", self._delta_cx_max)
+        )
+        self._prior_age_max = int(
+            self.cfg.get("LINE_CX_PRIOR_AGE_MAX_FRAMES", 5)
+        )
+        if self._prior_age_max < 0:
+            self._prior_age_max = 0
 
         # 历史：早期 OSD 通过 ``image.draw_image`` 画 binary，必须有一个 MMZ
-        # 分配的 GRAYSCALE image.Image 作为 source（因为 ALLOC_REF wrap 在
-        # K230 上作为 draw_image source 会静默失败）。当时这里持有
+        # 分配的 GRAYSCALE image.Image 作为 source。当时这里持有
         # ``self._roi_img = image.Image(roi_w, roi_h, image.GRAYSCALE)``，
         # process() 末尾再 ``_roi_img.copy_from(src_wrap)`` 把 bin_inv_roi
         # 搬进 MMZ，每帧 ~48 KB memcpy ≈ 1-2 ms。
         #
-        # 现在 OSD 已经改走 ``bytes(detection.binary_np)`` + Python 字节扫描，
+        # 现在 OSD 改走 ``bytes(detection.binary_np)`` + Python 字节扫描，
         # 不再消费 binary_image，因此 _roi_img + copy_from 整条路径删掉，
         # 主路径每帧省 1-2 ms。binary_image 字段保留但置 None，向后兼容。
 
-        # 预创建可复用的结果容器：bands 列表只在 process 里改字段，不重建。
         self._result = DetectionResult()
         self._result.bands = [
             BandResult(
@@ -287,6 +433,11 @@ class LineDetector:
             for i in range(self._band_count)
         ]
         self._result.binary_image = None
+
+        # process 中临时复用：每带的 col_vals（Python int list）与 runs（tuple list）
+        # 不能跨帧持有（下一帧立刻被覆盖），但每帧分配新 list 比每带分配
+        # 一次再清空更便宜（短 list 在 MicroPython 上 GC 友好）。
+        self._scratch_runs = [None] * self._band_count
 
     # ------------------------------------------------------------------ #
     # 主入口
@@ -308,12 +459,12 @@ class LineDetector:
 
         if img is None:
             self._reset_bands_invalid("no_image")
+            self._decay_priors_all()
             return result
 
         img_np = img.to_numpy_ref()
 
         # ---------- L0: cv_lite 二值化 ---------- #
-        # bin_raw: 黑线像素 (val ≤ thresh) → 0；背景 (val > thresh) → 255
         try:
             bin_raw = cv_lite.grayscale_threshold_binary(
                 self._image_shape, img_np, int(threshold), 255
@@ -322,21 +473,17 @@ class LineDetector:
             reraise_if_stop(e)
             print("[line_detector] L0 binarize failed:", e)
             self._reset_bands_invalid("L0_fail")
+            self._decay_priors_all()
             return result
 
         # ---------- 反相到 ROI（黑线 = 前景 = 255） ---------- #
         # 仅对 ROI 行做反相，省一半 alloc / 算力。bin_inv_roi 是 heap-allocated
         # 的 ulab ndarray；L2 直接消费它，OSD 通过 ``bytes(bin_inv_roi)``
-        # 物化后扫描，**不再走 image.Image MMZ 路径**——因此既不需要
-        # _roi_img 也不需要 copy_from，主路径每帧省 1-2 ms。
+        # 物化后扫描。
         bin_inv_roi = 255 - bin_raw[self._roi_y : self._roi_y + self._roi_h, :]
-        result.binary_np = bin_inv_roi  # 给 L2 / OSD bytes() 消费
+        result.binary_np = bin_inv_roi
 
         # ---------- L1: 形态学开运算（可选） ---------- #
-        # ALLOC_REF wrap 让 image 模块"看到"ndarray buffer 做就地 open(1)，
-        # 实测能正确写回 ulab 视角（image 模块对 ALLOC_REF 写入是 OK 的，
-        # 仅作为 draw_image source / mask 才会静默失败）。L1 关闭时整块
-        # wrap 都不创建，省一次 image.Image 构造。
         if self._l1_backend == "image_open":
             try:
                 src_wrap = image.Image(
@@ -348,12 +495,10 @@ class LineDetector:
                 reraise_if_stop(e)
                 print("[line_detector] L1 open(1) failed:", e)
 
-        # ---------- L2: 5 条扫描带质心 ---------- #
+        # ---------- L2.a/b/c: 列向求和 + bytes 解码 + 段查找 ---------- #
+        # 先把 5 条带的 col_sum 各算一次、解码成 Python int list、找出 runs。
+        # 选段（依赖跨带 prior）放到第二轮做。
         bands = result.bands
-        prev_cx = -1.0
-        prev_valid = False
-        valid_count = 0
-        mass_total = 0.0
         for i in range(self._band_count):
             band = bands[i]
             band.valid = False
@@ -367,154 +512,101 @@ class LineDetector:
 
             # 列向求和：8 行 × 320 列 → 320 长向量。
             #
-            # **K230 ulab quirk（实测踩到）**：``np.sum(band_slice, axis=0)``
-            # 在 K230 当前固件上**忽略 axis 参数**，对 (8, 320) 输入返回标量
-            # 总和（等价 ``np.sum(band_slice)``）。下游 ``arange_x * col_sum``
-            # 会被 broadcast 成 ``arange_x * scalar``，于是
-            #   cx = sum(arange_x * scalar) / mass = scalar * sum(arange_x) / mass
-            # 当 mass ≈ scalar 时（band_slice 求和后等于 mass），cx 退化为
-            # ``sum(arange_x) = 0+1+...+(W-1) = 51040``（W=320），表现为 cxN
-            # 永远卡在 51040.x 不变，且 width 也只剩 0/1（标量比较），从而触发
-            # ``_draw_detection`` 把 51040 当 cx 喂给 OSD，display_x=127600
-            # 屏幕外大坐标让 K230 OSD 进入慢路径 → FPS 从 33 跌到 13。
-            #
-            # 修复：手工按行累加 ``band_slice[r]``。每行是 (W,) 1-D ndarray，
-            # 加法在 ulab 是向量化的；BAND_HEIGHT_PX=8 总共 7 次加法 ≈ 0.3ms，
-            # 比 ``axis=0`` 求和稳但开销可忽略。
+            # **K230 ulab quirk**：``np.sum(band_slice, axis=0)`` 在 K230
+            # 当前固件上忽略 axis 参数，对 (8, 320) 输入返回标量总和。
+            # 修复：手工按行累加 ``band_slice[r]``。BAND_HEIGHT_PX=8 总共
+            # 7 次加法 ≈ 0.3ms。详见 task_log §4 已知问题。
             col_sum = band_slice[0] + band_slice[1]
             for r in range(2, self._band_h):
                 col_sum = col_sum + band_slice[r]
 
-            # 防御：万一 ulab 行为再变，立即捕获。col_sum 必须是 W 长度向量；
-            # 若是标量（len 抛 TypeError 或 != W），把整带置为无效并跳过。
             try:
                 if len(col_sum) != self._roi_w:
                     band.reject = "col_sum_shape"
-                    prev_valid = False
-                    prev_cx = -1.0
+                    self._scratch_runs[i] = None
                     continue
             except TypeError:
                 band.reject = "col_sum_scalar"
-                prev_valid = False
-                prev_cx = -1.0
+                self._scratch_runs[i] = None
                 continue
 
-            mass = float(np.sum(col_sum))
-            band.mass = mass
-            mass_total += mass
+            col_vals = _decode_col_sum_bytes(col_sum, self._roi_w)
+            if col_vals is None:
+                band.reject = "decode_fail"
+                self._scratch_runs[i] = None
+                continue
 
-            col_stats = None
-            if self._prefer_bytes_col_stats:
-                col_stats = _col_sum_stats_from_bytes(
-                    col_sum, self._roi_w, self._col_sum_thr
+            self._scratch_runs[i] = _find_runs(
+                col_vals, self._col_sum_thr, self._gap_tol
+            )
+
+        # ---------- L2.d/e: 选段（NEAR→FAR 传播 + 时空 prior） ---------- #
+        # 顺序：bands[-1] (NEAR) → bands[0] (FAR)。NEAR 是 e_y 主源、置信
+        # 最高，先选定后给后续带提供空间 prior。
+        valid_count = 0
+        mass_total = 0.0
+        prev_neighbor_cx = -1.0  # 传播链中"上一带本帧选中的 cx"
+
+        for i in range(self._band_count - 1, -1, -1):
+            band = bands[i]
+            runs = self._scratch_runs[i]
+            if runs is None:
+                # 已在前一阶段标记 reject，prior 衰减
+                band.cx_prev_age += 1
+                if band.cx_prev_age > self._prior_age_max:
+                    band.cx_prev = -1.0
+                continue
+
+            if not runs:
+                band.reject = "no_runs"
+                band.cx_prev_age += 1
+                if band.cx_prev_age > self._prior_age_max:
+                    band.cx_prev = -1.0
+                continue
+
+            prev_cx_for_select = -1.0
+            if (band.cx_prev >= 0.0
+                    and band.cx_prev_age <= self._prior_age_max):
+                prev_cx_for_select = band.cx_prev
+
+            picked = _select_best_run(
+                runs,
+                self._min_mass[i],
+                self._w_min[i],
+                self._w_max[i],
+                prev_cx_for_select,
+                prev_neighbor_cx,
+                self._prior_radius,
+                self._delta_cx_max,
+            )
+
+            if picked is None:
+                # 最常见三种原因：mass<MIN、width 不在 [W_MIN, W_MAX]、
+                # 时空 prior 都把它挡了。把最具诊断价值的"最大 mass 候选
+                # 但 width / mass 不达标"压成一行 reject。
+                band.reject = self._diagnose_no_pick(
+                    runs, i
                 )
-
-            # 等效宽度：col_sum 中超过阈值的列数。
-            # ulab 的比较在不同固件上可能返回 bool(1) 或 uint8(255)；
-            # 因此 sum 结果若超过 ROI 宽度，就退回 Python 计数（每带 320 次）。
-            if col_stats is not None:
-                band.width_px = col_stats[0]
-            else:
-                try:
-                    width_mask = col_sum > self._col_sum_thr
-                    band.width_px = int(np.sum(width_mask))
-                    if band.width_px > self._roi_w:
-                        col_stats = _col_sum_stats_from_bytes(
-                            col_sum, self._roi_w, self._col_sum_thr
-                        )
-                        if col_stats is not None:
-                            self._prefer_bytes_col_stats = True
-                            band.width_px = col_stats[0]
-                        else:
-                            w = 0
-                            thr = self._col_sum_thr
-                            for v in col_sum:
-                                if _scalar_to_int(v) > thr:
-                                    w += 1
-                            band.width_px = w
-                except Exception:
-                    col_stats = _col_sum_stats_from_bytes(
-                        col_sum, self._roi_w, self._col_sum_thr
-                    )
-                    if col_stats is not None:
-                        self._prefer_bytes_col_stats = True
-                        band.width_px = col_stats[0]
-                    else:
-                        w = 0
-                        thr = self._col_sum_thr
-                        for v in col_sum:
-                            if _scalar_to_int(v) > thr:
-                                w += 1
-                        band.width_px = w
-
-            # 硬约束：mass / 宽度 / 与上一有效带的 Δcx
-            if mass < self._min_mass[i]:
-                band.reject = "mass<%d" % self._min_mass[i]
-                prev_valid = False
-                prev_cx = -1.0
+                band.cx_prev_age += 1
+                if band.cx_prev_age > self._prior_age_max:
+                    band.cx_prev = -1.0
                 continue
 
-            if col_stats is not None:
-                cx = col_stats[1] / mass
-            else:
-                cx = float(np.sum(self._arange_x * col_sum) / mass)
-            # K230 ulab 还可能在 1-D 加权求和里把 col_sum 当标量广播，
-            # 表现为 cx≈sum(0..319)=51040。遇到越界值时退回按列加权求和。
-            if cx < 0.0 or cx >= float(self._roi_w):
-                col_stats = _col_sum_stats_from_bytes(
-                    col_sum, self._roi_w, self._col_sum_thr
-                )
-                weighted = col_stats[1] if col_stats is not None else 0.0
-                if col_stats is not None:
-                    self._prefer_bytes_col_stats = True
-                    band.width_px = col_stats[0]
-                else:
-                    x = 0
-                    for v in col_sum:
-                        weighted += x * _scalar_to_int(v)
-                        x += 1
-                cx = weighted / mass
-            # cx 必须落在 ROI 列范围内；如果超出（理论上不可能，除非
-            # col_sum 又变标量），把该带置为无效，避免下游 OSD ``draw_circle``
-            # 拿到屏幕外大坐标进入 K230 image 模块慢路径，FPS 从 33 跌到 13。
-            if cx < 0.0 or cx >= float(self._roi_w):
-                band.reject = "cx_oob_%.1f" % cx
-                prev_valid = False
-                prev_cx = -1.0
-                continue
-            band.cx_px = cx
-
-            w = band.width_px
-            if w < self._w_min[i]:
-                band.reject = "w<%d" % self._w_min[i]
-                prev_valid = False
-                prev_cx = -1.0
-                continue
-            if w > self._w_max[i]:
-                band.reject = "w>%d" % self._w_max[i]
-                prev_valid = False
-                prev_cx = -1.0
-                continue
-
-            if prev_valid and prev_cx >= 0:
-                dcx = cx - prev_cx
-                if dcx < 0:
-                    dcx = -dcx
-                if dcx > self._delta_cx_max:
-                    band.reject = "dcx>%d" % self._delta_cx_max
-                    prev_valid = False
-                    prev_cx = -1.0
-                    continue
-
+            x_l, x_r, mass_seg, weighted_seg, cx, width = picked
+            band.mass = float(mass_seg)
+            band.cx_px = float(cx)
+            band.width_px = int(width)
             band.valid = True
+            band.cx_prev = float(cx)
+            band.cx_prev_age = 0
+
             valid_count += 1
-            prev_valid = True
-            prev_cx = cx
+            mass_total += float(mass_seg)
+            prev_neighbor_cx = float(cx)
 
         result.mass_total = mass_total
         result.n_valid = valid_count
 
-        # 近带在 bands[-1]（y_top 最大），远带在 bands[0]（y_top 最小）
         if bands[-1].valid:
             result.cx_near_px = bands[-1].cx_px
         if bands[0].valid:
@@ -526,6 +618,42 @@ class LineDetector:
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
+
+    def _diagnose_no_pick(self, runs, band_idx):
+        """选段失败时挑出"信息最多"的 reject 字段。
+
+        逻辑：在所有 run 里挑 mass 最大的那个，按它失败的具体维度命名。
+        让日志直接告诉你"是 mass 不够、width 太宽、还是被 prior 挡了"。
+        """
+        if not runs:
+            return "no_runs"
+        best = runs[0]
+        for r in runs[1:]:
+            if r[2] > best[2]:
+                best = r
+        x_l, x_r, mass, weighted = best
+        w = x_r - x_l
+        min_mass = self._min_mass[band_idx]
+        w_min = self._w_min[band_idx]
+        w_max = self._w_max[band_idx]
+        if mass < min_mass:
+            return "mass<%d" % min_mass
+        if w < w_min:
+            return "w<%d" % w_min
+        if w > w_max:
+            return "w>%d" % w_max
+        return "prior_reject"
+
+    def _decay_priors_all(self):
+        """所有带的 cx_prev_age++；超过阈值则丢弃 prior。
+
+        异常路径（snapshot 失败 / L0 失败）调用，让 prior 不会"卡在"
+        几帧前的位置。
+        """
+        for band in self._result.bands:
+            band.cx_prev_age += 1
+            if band.cx_prev_age > self._prior_age_max:
+                band.cx_prev = -1.0
 
     def _reset_bands_invalid(self, reason):
         for band in self._result.bands:
@@ -548,4 +676,7 @@ class LineDetector:
                     "[line_detector.self_test] band %d out of ROI" % i
                 )
                 return False
+        if self._gap_tol < 0:
+            print("[line_detector.self_test] gap_tol must be >= 0")
+            return False
         return True

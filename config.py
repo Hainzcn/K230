@@ -10,7 +10,7 @@
 - 标定结果统一存放在 ``calib.json``，由 :func:`load_calibration` 在启动期载入。
 """
 
-CONFIG_VERSION = "phaseB-0.1"
+CONFIG_VERSION = "phaseB-0.2"
 
 # ---------------------------------------------------------------------------
 # 显示设备
@@ -177,12 +177,12 @@ PHOTO_FALLBACK_K_SIGMA = 3.0
 #   灰度像素会被判作前景；负值 ⇒ 收紧。电工胶带（grayscale ~50~80）建议先
 #   保留 0；若用更亮的"近黑"材料（如 PVC、磨砂塑料）出现"前景偏稀"，可调
 #   到 +10~+20 再看二值图叠加。
-LINE_THRESHOLD_BIAS = 0
+LINE_THRESHOLD_BIAS = 10
 # - LINE_THRESHOLD_MIN / MAX：硬下限 / 上限。Otsu 在病态场景偶尔会给出极低
 #   或极高值（例如全场都是黑色阴影时给 < 20），下限保证黑色目标不会因此完全
 #   不被检出；上限避免过度饱和把背景一起判作前景。
-LINE_THRESHOLD_MIN = 10
-LINE_THRESHOLD_MAX = 60
+LINE_THRESHOLD_MIN = 20
+LINE_THRESHOLD_MAX = 80
 
 # ---------------------------------------------------------------------------
 # 阶段 B：扫描带几何（plan §6.2）
@@ -250,7 +250,46 @@ else:
 # 30 px / (35 px 带间距) = tan ≈ 0.86，对应 ~40°，足够容忍最严的圆切线。
 # bench 模式下桌面线缆 / 走线槽朝向任意，把 dcx 上限放到 ROI 全宽，
 # 等同禁用 dcx 检查；bench 仅靠 ``MIN_MASS_PER_BAND`` 过滤每条带。
+#
+# **phaseB-0.2 起语义改变**：之前 ``DELTA_CX_MAX_PX`` 是事后剔除（band j
+# 的 cx 与 band j-1 已选 cx 差超过该值则丢弃 band j）；现在用作"段选择
+# 阶段的空间 prior 半径"——band j 的候选段必须落在"上一带已选 cx ±
+# DELTA_CX_MAX_PX"内才参与选段排序，干扰物在 prior 之外直接出局，
+# 不再"拉偏全列质心后再剔除"。同一个数值，更早起作用。
 DELTA_CX_MAX_PX = 320 if LINE_DETECTION_PROFILE == "bench" else 30
+
+# ---------------------------------------------------------------------------
+# 阶段 B (phaseB-0.2)：段查找 + 时空 prior（plan §6.2 抗干扰升级）
+# ---------------------------------------------------------------------------
+# 背景：旧 cx 计算是 ``cx = Σx·col_sum / Σcol_sum``——ROI 内有任何前景像素
+# 都按质量加权进入平均值。一旦 ROI 出现"另一块黑"（路面碎屑 / 阴影 / 桌面
+# 异色），cx 会被拉到"主黑线 + 干扰"二者的质心位置，控制律按这个跟踪相当于
+# 直接撞过去。早期 task_log §4 的 ``[ ] 阴影 / 反光抗干扰升级`` TODO 就是
+# 为此预留。
+#
+# 反光问题（黑线中间镜面反光打洞、把单段拆成两段）由镜头加偏振片在硬件侧
+# 处理；软件侧只解决"干扰物体"。
+#
+# 新数据流：col_sum → find_runs(>COL_SUM_THR) → 候选筛选(W/MASS) →
+# 选段排序(时域 prior → 空间 prior → mass 兜底) → 选中段的 cx_seg/width。
+# 详见 vision/line_detector._find_runs_from_bytes / _select_best_run。
+
+# 桥接窄洞：连续段查找时，允许 ≤ N 列的"低于 COL_SUM_THR_FOR_WIDTH"被
+# 视作段内（防 sensor 噪声 / 抗锯齿把单段断成两短段，让 W_MIN 过滤失误）。
+# 0  = 严格（旧行为）；
+# 1  = 允许 1 列窄洞（推荐默认；电气胶带边缘 1 px 抗锯齿常见）；
+# 2+ = 更宽松，但会把"两条相距 ≤ N 的窄黑线"误连成一条。
+LINE_RUN_GAP_TOLERANCE_PX = 1
+
+# 时域 prior：上一帧本带选中的 cx 作为本帧选段时的最优先排序依据。
+# 半径外的候选段被时域 prior 排除；半径内的按 |cx - prev_cx| 升序排序。
+# 默认复用 DELTA_CX_MAX_PX，避免再开旋钮。
+LINE_CX_PRIOR_RADIUS_PX = DELTA_CX_MAX_PX
+
+# 时域 prior 失效阈值：cx_prev 在该帧数后视为过期（不参与选段）。
+# 30 FPS 下 5 帧 ≈ 167 ms。短于人眼反应时间，能容忍偶发遮挡 / 单帧丢检；
+# 长时间真丢线时不让陈旧 prior 把检测拉回错误区域。
+LINE_CX_PRIOR_AGE_MAX_FRAMES = 5
 
 # ---------------------------------------------------------------------------
 # 阶段 B：L1 形态学后端
