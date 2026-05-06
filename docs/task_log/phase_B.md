@@ -171,7 +171,7 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 - `DebugOverlay._draw_detection(detection)`：5 条带边框（青）+ 每带 cx 圆点（valid 绿、
   invalid 红，半径 4 px）+ 等效宽度水平短线段（黄，cx ± width/2）；
 - 文本行新增 `Q V cxN thr` 一行，Q < 40 时整行红；
-- 复算态额外追加红色 `PHOTO recal i/N` 行；
+- 复算态额外追加红色 `PHOTO recal i/N` 行，右对齐显示在屏幕右端；
 - 算法坐标 → 显示坐标用 `DebugOverlay.algo_xy_to_display` 等比例缩放（与 ROI 一致）。
 
 #### 2.2.9 控制台 5 s 节流日志
@@ -462,8 +462,9 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
   3. `Camera` 增加 `binary_overlay_enabled()` /
      `set_binary_overlay_enabled()`，运行期更新已缓存的 `_binary_overlay_enabled`；
   4. `vision_line_tracking.py` 每帧轮询按键，触发后立即
-     `render_overlay(cached_lines, detection=detection)`，并在 OSD 文字行显示
-     `BIN ON/OFF`。本地 linter 与 Python AST 语法检查通过；板端还需实测按键
+     `render_overlay(..., detection=detection)`，并在 OSD 文字行短暂显示
+     `BTN BIN ON/OFF` 按键事件；平时不再常驻显示二值 overlay 状态。
+     本地 linter 与 Python AST 语法检查通过；板端还需实测按键
      翻转和去抖效果。
 - [ ] **OSD 信息密度**：阶段 B 加了 Q/V/cxN/thr 一行，逼近 3 行 OSD 上限；
   阶段 C 起 IPM 后会再加 `e_y_mm / ψ_e_mrad / R̂_mm`，需要决定是否拆
@@ -532,9 +533,10 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 | `thr` | 灰度 | `photometric.threshold`，本帧 L0 二值化阈值 | bench: 50~80；track: 60~100 |
 | `mu` | 灰度 | 上次 bootstrap / 漂移重标定测得的 ROI 背景均值 `μ_bg` | 取决于环境光 |
 | `sig` | 灰度 | 同上的 `σ_bg`（背景标准差） | < μ/3 才算单峰高斯 |
-| `mem` | byte | `gc.mem_free()` 当前剩余堆 | 略波动；震荡 < 10% 为 OK |
-| `min` | byte | 启动以来 `mem_free` 的最小观察值 | 关注 drift% |
-| `max` | byte | 启动以来 `mem_free` 的最大观察值 | 同上 |
+| `mem_free` | byte | `gc.mem_free()` 当前 MicroPython 堆剩余；不是开发板 1GB DDR/MMZ | 略波动；震荡 < 10% 为 OK |
+| `mem_alloc` | byte | `gc.mem_alloc()` 当前 MicroPython 堆已分配；不支持时为 -1 | 结合 total 看堆占用 |
+| `mem_total` | byte | `mem_free + mem_alloc` 推算的 MicroPython 堆总量；不支持时为 -1 | 运行期应基本固定，远小于 1GB 属正常 |
+| `free_min/free_max` | byte | 启动以来 `mem_free` 的最小 / 最大观察值 | 关注 drift% |
 | `drift` | % | `(max-min)/max` 内存震荡幅度，plan §12 阶段 A 验收要求 ≤ 10% | < 5% 为优 |
 
 附加可能出现的告警字段（满足触发条件才会打印）：
@@ -554,9 +556,10 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 |---|---|---|
 | 1 | `FPS xx.x  (T xx.x ms)` | 同 `algo_fps` / `period`；`T > FRAME_PERIOD_ALERT_MS` 时整行红 |
 | 2 | `Q xx.x  V n/N  cxN xx.x  thr nn` | 同上 4 字段；`Q < Q_HOLD` 时整行红 |
-| 3a (条件) | `PHOTO recal n/30` | 仅在 photometric 重标定中显示（红） |
-| 3b (条件) | `MEM xxx KB  (drift x.x%)` | 仅在 `drift% ≥ MEM_DRIFT_ALERT_PCT` 或 `mem < MEM_LOW_ALERT_BYTES` 时显示（红） |
+| 3a (条件) | `PHOTO recal n/30` | 仅在 photometric 重标定中显示（红，右对齐） |
+| 3b (条件) | `MEM used a/b KB  free c KB  drift x.x%` | 仅在 `drift% ≥ MEM_DRIFT_ALERT_PCT` 或 `free < MEM_LOW_ALERT_BYTES` 时显示（红） |
 | 3c (条件) | `CAP n/N` | 仅在 `CAPTURE_ENABLE=True` 采样模式下显示 |
+| 3d (事件) | `BTN BIN ON/OFF` | 仅在按键切换 binary overlay 后短暂显示（红） |
 
 ### 7.3 `[camera.dbg] binary` 调试行（启动后前 ~10 帧打印）
 

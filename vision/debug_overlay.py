@@ -186,14 +186,16 @@ class DebugOverlay:
             self._draw_detection(detection)
 
         if lines:
-            x = 8
             y = 8
             font_h = self.cfg.OSD_TEXT_SIZE_PX
             default_color = self.cfg.OSD_TEXT_COLOR
             for item in lines:
+                x = 8
                 if isinstance(item, tuple):
                     text = item[0]
                     col = item[1] if len(item) > 1 and item[1] is not None else default_color
+                    if len(item) > 2 and item[2] == "right":
+                        x = self._right_text_x(text, font_h)
                 else:
                     text = item
                     col = default_color
@@ -201,6 +203,11 @@ class DebugOverlay:
                 y += font_h + 2
 
         return True
+
+    def _right_text_x(self, text, font_h):
+        """返回文本起始 x；K230 无测宽 API，ASCII 调试文本按 0.6em 估算。"""
+        text_w = int(len(text) * font_h * 0.6)
+        return max(0, self.cfg.DISPLAY_WIDTH - text_w - 8)
 
     def _draw_roi(self, rect, color, thickness):
         x, y, w, h = rect

@@ -102,10 +102,11 @@ GC_THRESHOLD_BYTES = 64 * 1024
 LOG_INTERVAL_MS = 5000               # 控制台日志节流（plan §9.2 守则 9）
 SNAPSHOT_TIMEOUT_MS = 200
 
-# OSD 内存告警阈值：仅当发生以下任一情形时，才把内存信息叠加到调试 OSD。
-# 正常运行期 OSD 只显示帧率与丢帧率，保持简洁。
+# OSD 内存告警阈值：这里的 free/alloc 只来自 MicroPython 堆，不代表开发板
+# 1GB DDR / MMZ 总资源；drift 看 mem_free 震荡，low-free 只在堆余量紧张时提示。
+# K230 运行期稳定 free 常在数 MB 级，不能把 4 MB 当作低内存阈值，否则会常驻告警。
 MEM_DRIFT_ALERT_PCT = 5.0            # 漂移超过 5% 提示（阶段 A 硬指标是 ≤10%）
-MEM_LOW_ALERT_BYTES = 4 * 1024 * 1024  # 剩余内存低于 4 MB 提示
+MEM_LOW_ALERT_BYTES = 512 * 1024     # 剩余堆低于 512 KB 才提示
 
 # 帧周期告警阈值（ms）：1000 / algo_fps > 该值时 OSD FPS 行标红。
 # 50 ms ≈ 20 FPS，对应 plan §12 阶段 A "带 OSD ≥ 20 FPS" 的底线。

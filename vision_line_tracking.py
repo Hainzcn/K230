@@ -82,6 +82,17 @@ def _format_band_diag(detection):
     return "; ".join(parts)
 
 
+def _mem_snapshot():
+    """返回 MicroPython 堆的 (free, alloc, total)，不是整机 1GB DDR/MMZ。"""
+    free = gc.mem_free()
+    try:
+        alloc = gc.mem_alloc()
+    except Exception:
+        alloc = -1
+    total = free + alloc if free >= 0 and alloc >= 0 else -1
+    return free, alloc, total
+
+
 def main():
     print(
         "[VLT] vision_line_tracking start, config=%s, debug=%s, profile=%s"
@@ -134,11 +145,13 @@ def main():
     if not photometric.self_test():
         print("[VLT] photometric self_test FAILED; using LINE_THRESHOLD_INIT fallback")
 
-    # 内存监测：plan §12 阶段 A 验收要求 mem_free 震荡 ≤ 10%
-    mem0 = gc.mem_free()
-    mem_min = mem0
-    mem_max = mem0
-    last_mem = mem0
+    # 内存监测：泄漏看 free 的震荡；OSD 展示用 alloc/total，避免把 free 误读成占用。
+    mem0_free, mem0_alloc, mem0_total = _mem_snapshot()
+    mem_min = mem0_free
+    mem_max = mem0_free
+    last_mem_free = mem0_free
+    last_mem_alloc = mem0_alloc
+    last_mem_total = mem0_total
 
     last_log_ms = time.ticks_ms()
     snapshot_fail_streak = 0
@@ -149,6 +162,9 @@ def main():
     # render_overlay 始终用最新 detection + 最近一次缓存的 lines 整体重画，
     # 这样高频 binary 刷新不会让文字行抖动。
     cached_lines = []
+    binary_event_text = None
+    binary_event_until_ms = 0
+    overlay_lines = cached_lines
 
     try:
         while True:
@@ -156,6 +172,13 @@ def main():
             # ticks_ms 放在循环顶部，即使 snapshot 持续失败也能让日志块按
             # LOG_INTERVAL_MS 节流地报警，不至于静默卡死。
             now = time.ticks_ms()
+            overlay_rendered = False
+            if (
+                binary_event_text is not None
+                and time.ticks_diff(binary_event_until_ms, now) <= 0
+            ):
+                binary_event_text = None
+                overlay_lines = cached_lines
 
             img = camera.read_algo_frame()
             if img is None:
@@ -173,7 +196,14 @@ def main():
             if binary_button.poll(now):
                 enabled = not camera.binary_overlay_enabled()
                 if camera.set_binary_overlay_enabled(enabled):
-                    camera.render_overlay(cached_lines, detection=detection)
+                    binary_event_text = "BTN BIN %s" % ("ON" if enabled else "OFF")
+                    binary_event_until_ms = time.ticks_add(
+                        now, config.OSD_REFRESH_INTERVAL_MS
+                    )
+                    overlay_lines = list(cached_lines)
+                    overlay_lines.append((binary_event_text, config.OSD_ALERT_COLOR))
+                    camera.render_overlay(overlay_lines, detection=detection)
+                    overlay_rendered = True
 
             # 采样落盘
             if (
@@ -197,12 +227,14 @@ def main():
 
             # ---- 1Hz 文字行更新（FPS / Q / 内存 / 标定状态）---- #
             if camera.maybe_update_fps(now):
-                cur_mem = gc.mem_free()
-                if cur_mem < mem_min:
-                    mem_min = cur_mem
-                if cur_mem > mem_max:
-                    mem_max = cur_mem
-                last_mem = cur_mem
+                cur_mem_free, cur_mem_alloc, cur_mem_total = _mem_snapshot()
+                if cur_mem_free < mem_min:
+                    mem_min = cur_mem_free
+                if cur_mem_free > mem_max:
+                    mem_max = cur_mem_free
+                last_mem_free = cur_mem_free
+                last_mem_alloc = cur_mem_alloc
+                last_mem_total = cur_mem_total
 
                 mem_drift_pct = (
                     100.0 * (mem_max - mem_min) / mem_max if mem_max > 0 else 0.0
@@ -247,16 +279,31 @@ def main():
                             config.PHOTO_BOOTSTRAP_FRAMES,
                         ),
                         config.OSD_ALERT_COLOR,
+                        "left",
                     ))
 
                 mem_alert = (
                     mem_drift_pct >= config.MEM_DRIFT_ALERT_PCT
-                    or cur_mem < config.MEM_LOW_ALERT_BYTES
+                    or cur_mem_free < config.MEM_LOW_ALERT_BYTES
                 )
                 if mem_alert:
+                    if cur_mem_alloc >= 0 and cur_mem_total > 0:
+                        mem_text = (
+                            "MEM used %d/%d KB  free %d KB  drift %.1f%%"
+                            % (
+                                cur_mem_alloc // 1024,
+                                cur_mem_total // 1024,
+                                cur_mem_free // 1024,
+                                mem_drift_pct,
+                            )
+                        )
+                    else:
+                        mem_text = (
+                            "MEM free %d KB  (drift %.1f%%)"
+                            % (cur_mem_free // 1024, mem_drift_pct)
+                        )
                     lines.append((
-                        "MEM %d KB  (drift %.1f%%)"
-                        % (cur_mem // 1024, mem_drift_pct),
+                        mem_text,
                         config.OSD_ALERT_COLOR,
                     ))
 
@@ -265,19 +312,25 @@ def main():
                         "CAP %d/%d"
                         % (capture_count, config.CAPTURE_MAX_SAMPLES)
                     )
-                lines.append(
-                    "BIN %s"
-                    % ("ON" if camera.binary_overlay_enabled() else "OFF")
-                )
                 # 文字行刷新：缓存最新 lines，并立即重画一次 OSD（含 binary）。
                 cached_lines = lines
-                camera.render_overlay(cached_lines, detection=detection)
+                if binary_event_text is not None:
+                    overlay_lines = list(cached_lines)
+                    overlay_lines.append((binary_event_text, config.OSD_ALERT_COLOR))
+                else:
+                    overlay_lines = cached_lines
+                camera.render_overlay(overlay_lines, detection=detection)
+                overlay_rendered = True
             # ---- binary overlay 独立频率刷新（默认每帧）---- #
-            elif detection is not None and camera.maybe_update_binary(now):
+            elif (
+                not overlay_rendered
+                and detection is not None
+                and camera.maybe_update_binary(now)
+            ):
                 # 用 1Hz 缓存的 lines 整体重画，避免 OSD 文字行抖动 / 缺失；
                 # binary overlay 内部只重画 ROI 内红色高亮 + 预览，开销
                 # ~10-30ms，不会拖累 algo FPS 低于 sensor 上限。
-                camera.render_overlay(cached_lines, detection=detection)
+                camera.render_overlay(overlay_lines, detection=detection)
 
             # 控制台日志节流：完整指标依然落日志，便于离线分析（plan §13.1）。
             if (
@@ -292,7 +345,8 @@ def main():
                     "[VLT] algo_fps=%.1f period=%.1fms frames=%d "
                     "Q=%.1f(%s) V=%d/%d cxN=%.1f cxF=%.1f thr=%d "
                     "mu=%.1f sig=%.1f%s "
-                    "mem=%d (min=%d max=%d drift=%.1f%%)"
+                    "mem_free=%d mem_alloc=%d mem_total=%d "
+                    "(free_min=%d free_max=%d drift=%.1f%%)"
                     % (
                         camera.algo_fps(),
                         camera.algo_period_ms(),
@@ -307,7 +361,9 @@ def main():
                         photometric.mu_bg,
                         photometric.sigma_bg,
                         " RECAL" if photometric.is_recalibrating else "",
-                        last_mem,
+                        last_mem_free,
+                        last_mem_alloc,
+                        last_mem_total,
                         mem_min,
                         mem_max,
                         mem_drift_pct,
@@ -348,7 +404,7 @@ def main():
         except Exception:
             pass
         print(
-            "[VLT] stopped, frames=%d, last_mem=%d, mem_range=%d~%d"
+            "[VLT] stopped, frames=%d, last_mem_free=%d, mem_range=%d~%d"
             % (
                 camera.frame_count() if camera else -1,
                 gc.mem_free(),
