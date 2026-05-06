@@ -343,7 +343,7 @@ OSD_CX_RADIUS_PX = 4                  # cx 圆点半径
 # 肉眼看到的"红色斑块"就是算法当前判定为黑线的像素，便于排查阈值偏差、
 # 阴影误检、形态学开运算前后的差异。
 # 实现：不依赖 osd.draw_image(mask=...)（K230 上该组合静默不显示）；
-# camera.py 用 ``bytes(binary_np)`` 一次物化为 Python bytes 后扫描 ROI，
+# debug_overlay.py 用 ``bytes(binary_np)`` 一次物化为 Python bytes 后扫描 ROI，
 # 按前景像素绘制 OSD 矩形。bytes 索引 ~50ns，远快于 ulab ``row[x]``
 # ~100us。
 DEBUG_SHOW_BINARY = True               # 主画面 ROI 红色 overlay 总开关

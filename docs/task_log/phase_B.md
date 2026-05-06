@@ -15,7 +15,7 @@
 | B-1 | 实现 `photometric.py`：Otsu + bootstrap + 运行期漂移监测 | §5.3 | ✅ 已完成 | `vision/photometric.py` |
 | B-2 | 实现 `line_detector.py`：L0 + L1 + L2（5 条扫描带 + 硬约束） | §6.1 / §6.2 | ✅ 已完成 | `vision/line_detector.py` |
 | B-3 | 实现 `quality.py`：Q_L2（仅含 L2 子项） | §6.6 | ✅ 已完成 | `vision/quality.py` |
-| B-4 | 调试叠加：扫描带 / cx 圆点 / 宽度 / Q_L2 | §12 阶段 B | ✅ 已完成 | `vision/camera.py` `_draw_detection` |
+| B-4 | 调试叠加：扫描带 / cx 圆点 / 宽度 / Q_L2 | §12 阶段 B | ✅ 已完成 | `vision/debug_overlay.py` `_draw_detection` |
 | B-5 | 独立光度标定脚本 | §5.3 / §11.1 | ✅ 已完成 | `tools/calibrate_photometric.py` |
 | B-6 | 主入口装配 photometric + detector | §11.3 | ✅ 已完成 | `vision_line_tracking.py` |
 | B-7 | 静止状态 σ(cx) 实测 | §12 阶段 B 验收 | ⏳ 待装车 | — |
@@ -34,8 +34,9 @@ K230/
 ├── tools/
 │   └── calibrate_photometric.py       # 30 帧 Otsu 标定脚本
 ├── vision/
-│   ├── __init__.py                    # __all__ 加 photometric / line_detector / quality
-│   ├── camera.py                      # render_overlay(lines, detection=)，增 _draw_detection / algo_xy_to_display
+│   ├── __init__.py                    # __all__ 加 debug_overlay / photometric / line_detector / quality
+│   ├── camera.py                      # sensor / display 驱动 + render_overlay 入口
+│   ├── debug_overlay.py               # OSD 绘制、检测可视化、binary overlay 节流
 │   ├── photometric.py                 # Photometric (阈值 + 漂移监测)
 │   ├── line_detector.py               # LineDetector (L0+L1+L2 段查找+时空 prior)
 │   └── quality.py                     # compute_q_l2 / grade
@@ -164,14 +165,14 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 
 #### 2.2.8 调试 OSD 增强
 
-`Camera.render_overlay(lines, detection=None)`：
+`Camera.render_overlay(lines, detection=None)` 委托 `DebugOverlay.draw(...)`：
 
 - ROI 框（沿用阶段 A）；
-- `_draw_detection(detection)`：5 条带边框（青）+ 每带 cx 圆点（valid 绿、
+- `DebugOverlay._draw_detection(detection)`：5 条带边框（青）+ 每带 cx 圆点（valid 绿、
   invalid 红，半径 4 px）+ 等效宽度水平短线段（黄，cx ± width/2）；
 - 文本行新增 `Q V cxN thr` 一行，Q < 40 时整行红；
 - 复算态额外追加红色 `PHOTO recal i/N` 行；
-- 算法坐标 → 显示坐标用 `algo_xy_to_display` 等比例缩放（与 ROI 一致）。
+- 算法坐标 → 显示坐标用 `DebugOverlay.algo_xy_to_display` 等比例缩放（与 ROI 一致）。
 
 #### 2.2.9 控制台 5 s 节流日志
 
@@ -353,7 +354,7 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
 - [x] **K230 OSD 二值图 / 黑区高亮仍不显示**：即使把 `bin_inv_roi` 复制到
   MMZ image 后，`ARGB8888 OSD.draw_image(GRAYSCALE source)` 与
   `draw_image(..., mask=GRAYSCALE)` 在实板上仍可能静默无显示；右上角预览窗
-  和 ROI 半透明色块都看不到。修复：`camera._draw_binary_debug` 不再走
+  和 ROI 半透明色块都看不到。修复：`DebugOverlay._draw_binary_debug` 不再走
   `draw_image` / `mask`，而是直接扫描 `detection.binary_np` 的前景连续段，
   在 OSD 上画白色二值预览与红色 ROI 高亮线段；主画面通过
   `OSD_BINARY_STRIDE_X/Y` 抽样，避免完全遮挡 VIDEO1。
@@ -382,7 +383,7 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
   3. preview / overlay 共用同一份 bytes，draw_rectangle 调用顺序合并
      在每条带的循环内，减少属性查找。
   实测预期：algo FPS 从 8.8 回到 30+ (sensor 上限)。详见
-  `vision/camera._draw_binary_debug` 与 `_draw_row_spans_from_bytes`。
+  `vision/debug_overlay.py` 的 `_draw_binary_debug` 与 `_draw_row_spans_from_bytes`。
 - [x] **二值 overlay 渲染模式拆分 + preview 独立开关**：用户希望（1）右上角
   预览能单独关闭；（2）主 ROI 红色高亮做成"完整连续半透明"，而不是只
   在 5 条带上的片状斑块。K230 `image.draw_rectangle` 签名只接受
@@ -396,7 +397,7 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
      `full_solid` / `full_dither`），后扩展为 5 档（见下条）；
   3. 全 ROI 扫描共 320×150=48000 次字节索引 ≈ 2.4ms；前景率 ~1-3%
      场景下 draw_rect 调用 ~300-1000 次，OSD 总耗时 < 30ms。
-  详见 `vision/camera._draw_overlay_full_dither` 与 `_draw_overlay_bands`。
+  详见 `vision/debug_overlay.py` 的 `_draw_overlay_full_dither` 与 `_draw_overlay_bands`。
 - [x] **桌面调试 V=0/5 → 加 `LINE_DETECTION_PROFILE` 双档**：用户对桌面
   白纸上的黑色线缆做模拟时，红色 overlay 显示正确（L0/L1/L2 主干通畅），
   但 V=0/5 全程 hold/lost。日志反推：`band_fg=89/12800 (0.7%)`，平均每带
@@ -416,7 +417,7 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
      方便实测时确认当前 profile 已生效。
   bench → track 切回时只改这一行字符串，不改其他参数。详见 `config.py`
   顶部 ``LINE_DETECTION_PROFILE`` 区块。
-- [x] **删除 line_detector copy_from MMZ 死路径**：camera.py OSD 改走
+- [x] **删除 line_detector copy_from MMZ 死路径**：debug_overlay.py OSD 改走
   `bytes(binary_np)` 字节扫描后，``detection.binary_image``（MMZ 镜像）
   零消费，但 line_detector 每帧仍 `_roi_img.copy_from(src_wrap)` 做
   ~48 KB memcpy ≈ 1-2 ms。删除后：
@@ -442,7 +443,7 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
      - `full_dither_12`：偶行 × 4 取 1 列，列起点交错避免竖排红线，
        12.5% 密度，最稀疏，每帧刷新仍 < 10ms；
   4. 兼容旧名 `full_dither` → 自动映射为 `full_dither_50`。
-  详见 `vision/camera.maybe_update_binary` 与 `_draw_overlay_full_dither`。
+  详见 `vision/debug_overlay.py` 的 `maybe_update_binary` 与 `_draw_overlay_full_dither`。
 - [x] **IDE 停止信号被调试容错吞掉**：K230/CanMV IDE 的停止请求有时以
   `IDE interrupt` 异常从 `snapshot()` / OSD 绘图 / 图像统计 API 抛出；早期
   为了容错写的 `except Exception` 会把它当普通错误打印后继续循环，导致程序
