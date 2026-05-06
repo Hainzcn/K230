@@ -10,7 +10,7 @@
 - 标定结果统一存放在 ``calib.json``，由 :func:`load_calibration` 在启动期载入。
 """
 
-CONFIG_VERSION = "phaseB-0.2"
+CONFIG_VERSION = "phaseC-0.1"
 
 # ---------------------------------------------------------------------------
 # 显示设备
@@ -397,9 +397,103 @@ OSD_BINARY_PREVIEW_STRIDE_Y = 2
 OSD_BINARY_MIN_RUN_PX = 2              # 过滤单像素噪点（仅 bands_only 用）
 
 # ---------------------------------------------------------------------------
+# 阶段 C：IPM 安装几何（plan §4.1，calib.json 缺失时用作 fallback H 推导）
+# ---------------------------------------------------------------------------
+# 实测装车后必须用 tools/calibrate_ipm.py 解出 H 写到 calib.json，覆盖此处。
+# 这里只是为了让代码骨架在装车前桌面 bench 上也能跑通全链路（OSD 会显式
+# 标 "CALIB:DEFAULT" 提醒用户：此时 e_y / ψ_e 数值有几十 mm 系统偏差）。
+MOUNT_H_CAM_MM = 120                   # 镜头离地高度（plan §4.1 80~150 mm）
+MOUNT_PITCH_DEG = 20.0                 # 光轴俯仰角（向下为正；plan §4.1 15~25°）
+MOUNT_YAW_DEG = 0.0                    # 光轴偏航（实测 < 1°）
+# OV5647 + 标准镜头（CanMV 套件默认）水平 FOV 约 54°；横纵 FOV 与
+# 1280×720 上的焦距 fx/fy 反推：fx = (W/2) / tan(HFOV/2)。下值仅作 fallback
+# 用，标定脚本里会覆盖。
+SENSOR_HFOV_DEG = 54.0
+SENSOR_VFOV_DEG = 41.0
+
+# IPM 后近处一行 / 远处一行的 mm/px 估值（plan §4.1 输出）。仅在 fallback
+# 模式下供 ground_mapper 用作车体坐标系输出的 sanity check 与 OSD 调试；
+# 标定模式下从 H 矩阵直接换算。
+MM_PER_PIX_NEAR = 1.0                  # ≈ NEAR 行 1 mm/px（视野较密）
+MM_PER_PIX_FAR = 4.0                   # ≈ FAR 行 4 mm/px（视野较疏）
+
+# ---------------------------------------------------------------------------
+# 阶段 C：RANSAC 圆弧拟合（plan §6.3）
+# ---------------------------------------------------------------------------
+# 黑线中心线半径先验：(800 mm 内径 + 18 mm 黑线宽度) / 2 = 409 mm。
+R_PRIOR_MM = 409.0
+# 半径先验容差：超出 ±50 mm 直接丢弃假设（plan §6.3）。
+R_PRIOR_TOL_MM = 50.0
+# 内点判据：圆上点到拟合圆的距离 ≤ ε 视为 inlier（plan §6.3）。
+RANSAC_INLIER_EPS_MM = 10.0
+# 至少 N 个 inlier 才视为成功（plan §6.3 "最小样本 3"）。
+RANSAC_MIN_INLIERS = 3
+# 5 个候选点 → C(5,3)=10 个 3-元组，枚举即可，无需随机迭代。
+# 若样本数 < MIN_SAMPLES，整帧 RANSAC 直接放弃，调用方走 L3b 直线 fallback。
+RANSAC_MIN_SAMPLES = 3
+
+# ---------------------------------------------------------------------------
+# 阶段 C：估计器（plan §7.4 EMA；一维 Kalman 留待阶段 E 之后）
+# ---------------------------------------------------------------------------
+EMA_ALPHA_E_Y = 0.5                    # plan §7.4 推荐 0.4~0.6
+EMA_ALPHA_PSI = 0.5
+# valid=False 时 EMA 保持上一帧；连续 N 帧失效后 reset()，避免陈旧值卡死控制律。
+EMA_AGE_MAX_FRAMES = 5
+
+# 符号防抖：sign(e_y) 翻转需连续 N 帧同号才接受（plan §8.1）。
+# 30 FPS 下 3 帧 ≈ 100 ms，足以抑制单帧抖动诱发的方向反转。
+SIGN_FLIP_DEBOUNCE_FRAMES = 3
+
+# ---------------------------------------------------------------------------
+# 阶段 C：Q_full 评分（plan §6.6 完整版；与 Q_L2 共存，bench 模式仍可只看 Q_L2）
+# ---------------------------------------------------------------------------
+# Q_full = w_mass · sat(mass_total / NOMINAL, 0, 1)        · 100
+#        + w_geom · sat(inlier_ratio, 0, 1)                · 100
+#        + w_cont · sat(1 − jitter / JITTER_REF, 0, 1)     · 100
+#        + w_r_prior · sat(1 − |R̂ − R_PRIOR| / 80, 0, 1)   · 100
+# 权重按 plan §6.6 推荐值；总和 1.0。
+Q_W_MASS = 0.3
+Q_W_GEOM = 0.3
+Q_W_CONT = 0.2
+Q_W_R_PRIOR = 0.2
+# r_prior 子项的归一化半径偏差（plan §6.6 注释里给的 80 mm）。
+Q_R_PRIOR_NORM_MM = 80.0
+
+# ---------------------------------------------------------------------------
+# 阶段 C：调试 OSD 颜色与几何
+# ---------------------------------------------------------------------------
+OSD_PATH_COLOR = (0, 255, 0)           # 5 点 cx 折线（绿）
+OSD_PATH_THICKNESS = 2
+OSD_TANGENT_COLOR = (255, 128, 0)      # 近带切线箭头（橙）
+OSD_TANGENT_THICKNESS = 2
+OSD_TANGENT_LEN_PX = 30                # 算法分辨率下的箭头长度
+OSD_CIRCLE_CENTER_COLOR = (255, 0, 255)  # 圆心反投点（品红）
+OSD_CIRCLE_CENTER_RADIUS_PX = 6
+OSD_CALIB_DEFAULT_COLOR = (255, 200, 0)  # CALIB:DEFAULT 文字（琥珀）
+OSD_NO_CALIB_COLOR = (255, 0, 0)         # NO CALIB 文字（纯红）
+
+# ---------------------------------------------------------------------------
 # 标定文件
 # ---------------------------------------------------------------------------
-# 完整标定（IPM/内参/光度合一）—— 阶段 C 才落到这里。
+# 完整标定（IPM/内参/光度合一）。阶段 C 起 ground_mapper 启动期解析此文件。
+# Schema（与 tools/calibrate_ipm.py 写出一致）::
+#
+#   {
+#     "config_version": "phaseC-0.1",
+#     "ts_ms": int,
+#     "ipm": {
+#       "H_3x3": [9 floats, row-major]   ← 像素 (u,v,1) → 地面 (x_g,y_g,1) 单应
+#       "image_wh": [320, 240],          ← 标定时使用的算法分辨率，必须匹配
+#       "corners_image":  [[u,v]*4],     ← 4 个标靶在图像上的像素坐标（仅记录）
+#       "corners_ground_mm": [[x,y]*4]   ← 4 个标靶在地面坐标系上的 mm 坐标
+#     },
+#     "photometric": {                   ← 可选；photometric.bootstrap 也能填
+#       "mu_bg": ..., "sigma_bg": ...,
+#       "thr_otsu": ..., "line_threshold": ...
+#     }
+#   }
+#
+# 字段缺失时由 ground_mapper / photometric 各自降级（plan §11.2）。
 CALIB_PATH = "/sdcard/calib.json"
 # 阶段 B 的独立光度标定脚本写盘路径（plan §11.1 tools/）。不污染 calib.json。
 PHOTO_CALIB_PATH = "/sdcard/calib_photometric.json"
@@ -419,9 +513,84 @@ def assert_version(required):
         )
 
 
-def load_calibration(path=None):
-    """启动期加载 ``calib.json``。阶段 A 仅占位，返回空 dict。
+def _safe_open_text(path):
+    """K230 / CPython 兼容的文本读取；任何异常都吞掉返回 None。"""
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except OSError:
+        return None
+    except Exception as e:
+        print("[config] load_calibration: open %s failed: %s" % (path, e))
+        return None
 
-    阶段 C 完成 IPM 标定后再实现完整的 JSON 解析与字段校验。
+
+def _validate_ipm_node(ipm):
+    """轻校验 IPM 节，返回 (ok, error_msg)。不抛异常。"""
+    if not isinstance(ipm, dict):
+        return False, "ipm node not dict"
+    h = ipm.get("H_3x3")
+    if not isinstance(h, (list, tuple)) or len(h) != 9:
+        return False, "ipm.H_3x3 must be list of 9 floats"
+    for v in h:
+        if not isinstance(v, (int, float)):
+            return False, "ipm.H_3x3 contains non-numeric"
+    wh = ipm.get("image_wh")
+    if wh is not None:
+        if not isinstance(wh, (list, tuple)) or len(wh) != 2:
+            return False, "ipm.image_wh must be [W, H]"
+        if int(wh[0]) != ALGO_WIDTH or int(wh[1]) != ALGO_HEIGHT:
+            return False, (
+                "ipm.image_wh=%sx%s mismatch ALGO=%dx%d"
+                % (wh[0], wh[1], ALGO_WIDTH, ALGO_HEIGHT)
+            )
+    return True, ""
+
+
+def load_calibration(path=None):
+    """启动期加载 ``calib.json``。
+
+    返回 dict；缺失或解析失败时返回 ``{}``，并在控制台打印诊断行。
+    调用方（``vision.ground_mapper.GroundMapper.load`` 等）按 dict 是否含
+    ``ipm.H_3x3`` 决定走标定 / fallback / NO CALIB 三档。
+
+    禁止抛异常：plan §11.2 规定模块自检不可阻塞主循环。
     """
-    return {}
+    try:
+        import ujson as json  # K230 优先
+    except ImportError:
+        import json
+    if path is None:
+        path = CALIB_PATH
+
+    text = _safe_open_text(path)
+    if text is None:
+        print("[config] load_calibration: %s not found, using fallback" % path)
+        return {}
+
+    try:
+        payload = json.loads(text)
+    except Exception as e:
+        print("[config] load_calibration: JSON parse failed: %s" % e)
+        return {"error": "json_parse"}
+
+    if not isinstance(payload, dict):
+        print("[config] load_calibration: top-level not dict")
+        return {"error": "not_dict"}
+
+    ver = payload.get("config_version")
+    if ver and ver != CONFIG_VERSION:
+        print(
+            "[config] load_calibration: WARNING calib version=%s vs current=%s"
+            % (ver, CONFIG_VERSION)
+        )
+
+    ipm = payload.get("ipm")
+    if ipm is not None:
+        ok, msg = _validate_ipm_node(ipm)
+        if not ok:
+            print("[config] load_calibration: ipm rejected: %s" % msg)
+            payload["ipm"] = None
+            payload["error"] = "ipm_invalid:" + msg
+
+    return payload

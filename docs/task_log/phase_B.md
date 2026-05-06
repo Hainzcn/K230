@@ -466,9 +466,6 @@ bootstrap 与运行期复算共享同一份 `_accumulate_one` / `_finalize_recal
      `BTN BIN ON/OFF` 按键事件；平时不再常驻显示二值 overlay 状态。
      本地 linter 与 Python AST 语法检查通过；板端还需实测按键
      翻转和去抖效果。
-- [ ] **OSD 信息密度**：阶段 B 加了 Q/V/cxN/thr 一行，逼近 3 行 OSD 上限；
-  阶段 C 起 IPM 后会再加 `e_y_mm / ψ_e_mrad / R̂_mm`，需要决定是否拆
-  `debug_overlay.py` 单独模块。
 
 ---
 

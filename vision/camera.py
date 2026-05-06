@@ -362,8 +362,8 @@ class Camera:
     # ------------------------------------------------------------------ #
     # 调试叠加
     # ------------------------------------------------------------------ #
-    def render_overlay(self, lines=None, detection=None):
-        """重绘 OSD：3 段 ROI + 总 ROI 外框 + 若干行文本 + (可选) 检测可视化。
+    def render_overlay(self, lines=None, detection=None, path=None):
+        """重绘 OSD：3 段 ROI + 总 ROI 外框 + 若干行文本 + (可选) 检测 / 路径可视化。
 
         plan §9.2 守则 7：仅在 ``maybe_update_fps`` 返回 ``True`` 时调用，
         不每帧刷新；正式比赛通过 ``DEBUG_DISPLAY=False`` 关闭。
@@ -376,11 +376,15 @@ class Camera:
         :param detection: 可选 :class:`vision.line_detector.DetectionResult`。
             非空时画 5 条扫描带边框、每带 cx 圆点（valid 绿/invalid 红）、
             每带等效宽度水平线段。Q_L2 由调用方放进 ``lines`` 文本行。
+        :param path: 可选 :class:`vision.debug_overlay.PathOverlayInfo`。
+            阶段 C 起非空时画 IPM 后的 5 点折线、圆心反投点 / ROI 边缘箭头、
+            近带切线箭头。``path.calib_mode == "none"`` 时跳过几何，仅靠
+            调用方在 ``lines`` 里追加红色 ``NO CALIB`` 文本提醒。
         """
         if not self.cfg.DEBUG_DISPLAY or self._osd is None:
             return
 
-        if self._debug_overlay.draw(lines, detection):
+        if self._debug_overlay.draw(lines, detection, path):
             Display.show_image(self._osd, x=0, y=0, layer=Display.LAYER_OSD0)
 
     # ------------------------------------------------------------------ #

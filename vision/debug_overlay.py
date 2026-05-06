@@ -2,12 +2,77 @@
 
 把检测几何、二值调试 overlay、OSD 文本与 FPS/二值刷新节流从
 ``vision.camera`` 中拆出，Camera 只负责提供 OSD buffer 与最终 display 入口。
+
+阶段 C 起新增 ``PathOverlayInfo`` 与 ``_draw_path_geometry``：把 IPM 后的
+圆心 / 切线 / 5 点折线绘制在 OSD 上，便于装车前在 LCD 直接看到
+``e_y_filt_mm`` / ``psi_e_filt_mrad`` / ``R̂`` 的几何来源。
 """
 
+import math
 import time
 
 import config
 from vision.interrupts import reraise_if_stop
+
+
+class PathOverlayInfo:
+    """阶段 C 路径几何 OSD 信息容器。
+
+    主入口每帧填一份再喂给 :meth:`DebugOverlay.draw`；debug_overlay 内部
+    用 ``mapper.ground_to_pixel`` 把地面坐标反投回图像坐标做可视化。
+
+    字段约定
+    -------
+
+    - ``calib_mode``：``"calibrated"`` / ``"default"`` / ``"none"``，与
+      :class:`vision.ground_mapper.GroundMapper.mode` 一致。``"none"`` 时
+      OSD 显示红色 ``NO CALIB``，跳过几何绘制。``"default"`` 时除正常画
+      几何外，再追加一行琥珀色 ``CALIB:DEFAULT`` 提醒系统偏差。
+    - ``arc_mode``：``"ransac"`` / ``"lsq"`` / ``"none"``。
+    - ``arc_xc / arc_yc / arc_R``：仅 ``arc_mode == "ransac"`` 时有意义。
+    - ``line_cx / line_cy / line_tx / line_ty``：仅 ``arc_mode == "lsq"`` 时
+      有意义；切线 ``(tx, ty)`` 已强制朝车头 +x。
+    - ``e_y_filt_mm`` / ``psi_e_filt_mrad``：经 EMA 滤波 + 符号防抖的
+      最终值（与 UART 帧 / 控制台日志同源）。``valid=False`` 时丢线保持。
+    - ``inlier_count`` / ``sample_count``：只用于 OSD 文本展示。
+    - ``mapper``：:class:`vision.ground_mapper.GroundMapper`；仅在
+      ``calib_mode != "none"`` 时为非 None。debug_overlay 通过它反投圆心 /
+      切线锚点回到图像坐标。
+
+    主入口必须显式调 :meth:`reset`（或重新 set）以清掉上一帧状态——
+    debug_overlay 不会自动失效字段。
+    """
+
+    __slots__ = (
+        "calib_mode",
+        "arc_mode",
+        "arc_xc", "arc_yc", "arc_R",
+        "line_cx", "line_cy", "line_tx", "line_ty",
+        "e_y_filt_mm", "psi_e_filt_mrad",
+        "inlier_count", "sample_count",
+        "valid",
+        "mapper",
+    )
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.calib_mode = "none"
+        self.arc_mode = "none"
+        self.arc_xc = 0.0
+        self.arc_yc = 0.0
+        self.arc_R = 0.0
+        self.line_cx = 0.0
+        self.line_cy = 0.0
+        self.line_tx = 1.0
+        self.line_ty = 0.0
+        self.e_y_filt_mm = 0.0
+        self.psi_e_filt_mrad = 0.0
+        self.inlier_count = 0
+        self.sample_count = 0
+        self.valid = False
+        self.mapper = None
 
 
 class DebugOverlay:
@@ -168,8 +233,8 @@ class DebugOverlay:
         )
         return True
 
-    def draw(self, lines=None, detection=None):
-        """重绘 OSD：ROI 框、文本，以及可选检测/二值图可视化。"""
+    def draw(self, lines=None, detection=None, path=None):
+        """重绘 OSD：ROI 框、文本，以及可选检测/二值图/路径几何可视化。"""
         if not self.cfg.DEBUG_DISPLAY or self._osd is None:
             return False
 
@@ -184,6 +249,13 @@ class DebugOverlay:
 
         if detection is not None:
             self._draw_detection(detection)
+
+        if path is not None and detection is not None:
+            try:
+                self._draw_path_geometry(detection, path)
+            except Exception as e:
+                reraise_if_stop(e)
+                print("[debug_overlay] path geometry draw failed:", e)
 
         if lines:
             y = 8
@@ -260,6 +332,165 @@ class DebugOverlay:
                 self._osd.draw_line(
                     wx0_d, wy_d, wx1_d, wy_d, color=width_color, thickness=2
                 )
+
+    # ------------------------------------------------------------------ #
+    # 阶段 C：路径几何可视化（5 点折线 + 圆心反投 + 切线箭头）
+    # ------------------------------------------------------------------ #
+    def _draw_path_geometry(self, detection, path):
+        """画 IPM 后的路径几何：5 点折线 + 圆心反投 + 切线箭头。
+
+        - ``path.calib_mode == "none"``：不画几何，依赖文本行显示 NO CALIB。
+        - 5 点折线：连接 detection.bands[i].cx_px @ band 中心 y 的有效点；
+          颜色 ``OSD_PATH_COLOR``。无需 mapper 参与（直接在像素域）。
+        - 圆心反投：用 mapper.ground_to_pixel(arc_xc, arc_yc) 反投回算法
+          坐标，再按 algo→display 等比例缩放；点落在屏幕外 / ROI 外的话
+          画一个朝向圆心方向的箭头（从 ROI 中心出发）。
+        - 切线箭头：在地面坐标系下沿切线方向走一段距离，再反投回图像；
+          画从近带 cx 出发的箭头，方向 = 切线在像素域的投影。
+        """
+        if path is None:
+            return
+        if path.calib_mode == "none":
+            return
+        # 1. 5 点折线
+        self._draw_band_polyline(detection.bands)
+
+        if not path.valid:
+            return
+
+        mapper = path.mapper
+        if mapper is None:
+            return
+
+        # 2. 圆心反投 / ROI 外箭头
+        if path.arc_mode == "ransac":
+            self._draw_circle_center_marker(mapper, path.arc_xc, path.arc_yc)
+
+        # 3. 切线箭头（从近带 cx 出发，朝切线方向）
+        bands = detection.bands
+        if bands and bands[-1].valid:
+            self._draw_tangent_arrow(mapper, path, bands[-1])
+
+    def _draw_band_polyline(self, bands):
+        """连接 5 条带的 valid cx 形成绿色折线。"""
+        if not bands:
+            return
+        color = self.cfg.OSD_PATH_COLOR
+        thick = int(getattr(self.cfg, "OSD_PATH_THICKNESS", 2))
+        prev = None
+        for b in bands:
+            if not b.valid or b.cx_px < 0:
+                prev = None
+                continue
+            cy = (b.y_top + b.y_bot) // 2
+            x_d, y_d = self.algo_xy_to_display(int(b.cx_px), cy)
+            if prev is not None:
+                self._osd.draw_line(prev[0], prev[1], x_d, y_d,
+                                    color=color, thickness=thick)
+            prev = (x_d, y_d)
+
+    def _draw_circle_center_marker(self, mapper, xc_g, yc_g):
+        """把圆心反投回图像；屏幕内画品红圆点，屏幕外画箭头指向圆心方向。
+
+        圆环半径 409 mm，车体在 (0, 0)；圆心在地面坐标系下离车 ~400 mm，
+        反投后通常落在 ROI 上方很远（图像 y < 0）甚至屏幕外。所以"屏幕外"
+        是常态，箭头模式更实用。
+        """
+        center_pix = mapper.ground_to_pixel(xc_g, yc_g)
+        if center_pix is None:
+            return
+        u, v = center_pix
+        color = self.cfg.OSD_CIRCLE_CENTER_COLOR
+        radius = int(getattr(self.cfg, "OSD_CIRCLE_CENTER_RADIUS_PX", 6))
+        if 0 <= u < self.cfg.ALGO_WIDTH and 0 <= v < self.cfg.ALGO_HEIGHT:
+            cx_d, cy_d = self.algo_xy_to_display(int(u), int(v))
+            self._osd.draw_circle(cx_d, cy_d, radius,
+                                  color=color, thickness=2, fill=True)
+            return
+        # 屏幕外：从 ROI 中心朝圆心方向画箭头（在算法坐标里完成方向计算）。
+        roi_x, roi_y, roi_w, roi_h = self.cfg.ROI_TOTAL_PX
+        cx_a = roi_x + roi_w * 0.5
+        cy_a = roi_y + roi_h * 0.5
+        dx = u - cx_a
+        dy = v - cy_a
+        norm = math.sqrt(dx * dx + dy * dy)
+        if norm < 1e-3:
+            return
+        L = max(20, radius * 4)
+        ex_a = cx_a + dx / norm * L
+        ey_a = cy_a + dy / norm * L
+        sx_d, sy_d = self.algo_xy_to_display(int(cx_a), int(cy_a))
+        ex_d, ey_d = self.algo_xy_to_display(int(ex_a), int(ey_a))
+        self._osd.draw_line(sx_d, sy_d, ex_d, ey_d, color=color, thickness=2)
+        self._draw_arrow_head(sx_d, sy_d, ex_d, ey_d, color)
+
+    def _draw_tangent_arrow(self, mapper, path, near_band):
+        """从近带 cx 出发画橙色切线箭头，方向 = 当前 arc/line 切线在像素域的投影。
+
+        实现思路：在地面坐标系下从近带的地面点 P_near 沿"切线前进方向"
+        走一小段（``TAN_LEN_MM``），把目标点 Q 反投回像素，连线即可。
+        """
+        # 近带地面点 P_near：用 mapper 把 (cx_px, mid_y) 投到地面
+        cy = (near_band.y_top + near_band.y_bot) // 2
+        p_near_g = mapper.pixel_to_ground(float(near_band.cx_px), float(cy))
+        if p_near_g is None:
+            return
+        x_n, y_n = p_near_g
+        # 切线方向（车体地面坐标系下）
+        if path.arc_mode == "ransac":
+            xc, yc = path.arc_xc, path.arc_yc
+            # 切线在 P_near 处的方向 ⊥ (P_near - C)；选与车头 +x 大致同向那个
+            rx = x_n - xc
+            ry = y_n - yc
+            r_norm = math.sqrt(rx * rx + ry * ry)
+            if r_norm < 1e-3:
+                return
+            tx = -ry / r_norm
+            ty = rx / r_norm
+            if tx < 0.0:
+                tx = -tx
+                ty = -ty
+        elif path.arc_mode == "lsq":
+            tx = path.line_tx
+            ty = path.line_ty
+        else:
+            return
+        TAN_LEN_MM = 200.0
+        x_q = x_n + TAN_LEN_MM * tx
+        y_q = y_n + TAN_LEN_MM * ty
+        q_pix = mapper.ground_to_pixel(x_q, y_q)
+        if q_pix is None:
+            return
+        u_q, v_q = q_pix
+        # 起点固定在近带 cx 像素中心
+        u_n = float(near_band.cx_px)
+        v_n = float(cy)
+        sx_d, sy_d = self.algo_xy_to_display(int(u_n), int(v_n))
+        ex_d, ey_d = self.algo_xy_to_display(int(u_q), int(v_q))
+        color = self.cfg.OSD_TANGENT_COLOR
+        thick = int(getattr(self.cfg, "OSD_TANGENT_THICKNESS", 2))
+        self._osd.draw_line(sx_d, sy_d, ex_d, ey_d, color=color, thickness=thick)
+        self._draw_arrow_head(sx_d, sy_d, ex_d, ey_d, color)
+
+    def _draw_arrow_head(self, sx, sy, ex, ey, color):
+        """简单 V 字箭头头部（在 display 坐标系下）。"""
+        dx = ex - sx
+        dy = ey - sy
+        norm = math.sqrt(dx * dx + dy * dy)
+        if norm < 4:
+            return
+        ux = dx / norm
+        uy = dy / norm
+        head = 8
+        # 旋转 ±150° 得到两个支线端点
+        cos_a = math.cos(math.radians(150))
+        sin_a = math.sin(math.radians(150))
+        ax1 = ex + head * (ux * cos_a - uy * sin_a)
+        ay1 = ey + head * (ux * sin_a + uy * cos_a)
+        ax2 = ex + head * (ux * cos_a + uy * sin_a)
+        ay2 = ey + head * (-ux * sin_a + uy * cos_a)
+        self._osd.draw_line(ex, ey, int(ax1), int(ay1), color=color, thickness=2)
+        self._osd.draw_line(ex, ey, int(ax2), int(ay2), color=color, thickness=2)
 
     def _draw_binary_debug(self, detection):
         """绘制二值图调试 overlay。preview 与 overlay 各自独立。"""

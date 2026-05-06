@@ -1,24 +1,28 @@
-"""K230 视觉循迹主入口（阶段 A 摄像头采集 + 阶段 B 多扫描带检测）。
+"""K230 视觉循迹主入口（阶段 A 采集 + 阶段 B 多扫描带 + 阶段 C IPM/RANSAC/EMA）。
 
 本文件**只负责装配**，不写算法细节（plan §11.3）。
 
-阶段 A（继承）：
-- CHN0 / CHN1 双通道初始化与显示绑定（``vision.camera.Camera``）；
-- OSD 叠加：``FPS / T / Q_L2 / valid / cx_near`` 文本行 + ROI 框 + 检测可视化；
-- ``KeyboardInterrupt`` / 异常 / 资源清理的统一保护；
-- 可选采样模式（``config.CAPTURE_*``）。
+阶段 A（继承）：双通道 sensor + 显示 + OSD 叠加 + 资源保护 + 可选采样。
 
-阶段 B（新增）：
-- ``vision.photometric.Photometric`` 启动期跑 30 帧 bootstrap 拿到 line_threshold；
-  运行期每 ~1 s 检查 ``μ_bg`` 漂移，超阈值就在背景任务里渐进重标定（不阻塞）。
-- ``vision.line_detector.LineDetector`` 每帧跑 L0 + (可选 L1) + L2，输出
-  5 条扫描带的 cx / mass / width / valid 与 Q_L2 评分。
-- OSD 增加：5 条扫描带边框、每带 cx 圆点（valid 绿/invalid 红）、宽度水平线段、
-  Q_L2 数值文本行；控制台 5 s 节流日志增加 ``q_l2 / valid / cx_near``。
+阶段 B（继承）：``vision.photometric`` bootstrap + 漂移监测；
+``vision.line_detector`` 每帧 L0 + (可选 L1) + L2 → 5 条扫描带 cx / mass /
+width / valid + Q_L2 评分。
 
-后续阶段（C 起）将在主循环里追加：
-``ground_mapper → geometry → estimator → controller → comms``，
-仍维持本文件 "装配 only" 的职责边界。
+阶段 C（新增）：
+- ``vision.ground_mapper.GroundMapper`` 把 5 条带 cx 通过 IPM 单应矩阵映射
+  到地面坐标 (mm)；``calib.json`` 缺失时用 plan §4.1 安装几何反推占位 H，
+  OSD 标 ``CALIB:DEFAULT``；占位都失败时跳过几何，OSD 显示 ``NO CALIB``。
+- ``vision.geometry.fit_circle_ransac`` 枚举 RANSAC 圆弧拟合（半径先验
+  ``409 ± 50 mm``）；失败 fallback 到 ``fit_line_lsq`` 一阶 TLS 直线。
+- ``vision.geometry.compute_path_errors_*`` 给出 plan §1.3 契约的 ``e_y_mm``
+  / ``ψ_e_mrad``（符号约定见 ``vision/geometry.py`` docstring）。
+- ``vision.estimator.PathErrorEstimator`` 跑 EMA (α=0.5) + 符号防抖 (3 帧)。
+- ``vision.quality.compute_q_full`` 给 plan §6.6 全权重 Q (mass + geom + cont
+  + r_prior)；阶段 B 的 Q_L2 仍可由 ``detection.q_l2`` 读到。
+- OSD 文本行扩展 + 几何叠加 (5 点 cx 折线 / 圆心反投 / 切线箭头)。
+- 5 s 控制台日志加 ``e_y_filt / psi_e_filt / R_hat / inliers / arc_mode / calib``。
+
+后续阶段（D 起）将追加：``comms`` (UART) → ``controller``。
 """
 
 import gc
@@ -31,7 +35,16 @@ from vision.camera import Camera
 from vision.gpio_button import GpioButton
 from vision.photometric import Photometric
 from vision.line_detector import LineDetector
-from vision.quality import grade as q_grade
+from vision.quality import grade as q_grade, compute_q_full
+from vision.ground_mapper import GroundMapper
+from vision.geometry import (
+    fit_circle_ransac,
+    fit_line_lsq,
+    compute_path_errors_arc,
+    compute_path_errors_line,
+)
+from vision.estimator import PathErrorEstimator
+from vision.debug_overlay import PathOverlayInfo
 
 
 def _ensure_dir(path):
@@ -145,6 +158,25 @@ def main():
     if not photometric.self_test():
         print("[VLT] photometric self_test FAILED; using LINE_THRESHOLD_INIT fallback")
 
+    # 阶段 C：IPM + 几何 + EMA 装配（plan §5.2 + §6.3 + §7.4）
+    calib = config.load_calibration()
+    mapper = GroundMapper()
+    calib_mode = mapper.load(calib)
+    print("[VLT] IPM mode: %s%s" % (
+        calib_mode,
+        ("  err=" + mapper.load_error()) if calib_mode == "none" else "",
+    ))
+    if calib_mode != "none" and not mapper.self_test():
+        print("[VLT] IPM self_test FAILED; demote to NO CALIB")
+        calib_mode = "none"
+    if calib_mode == "default":
+        print("[VLT] CALIB:DEFAULT — e_y/ψ_e values carry tens-of-mm system bias.")
+        print("[VLT]   to fix: run tools/calibrate_ipm.py on PC, copy calib.json to /sdcard/")
+    estimator = PathErrorEstimator(config)
+    path_overlay = PathOverlayInfo()
+    path_overlay.calib_mode = calib_mode
+    path_overlay.mapper = mapper if calib_mode != "none" else None
+
     # 内存监测：泄漏看 free 的震荡；OSD 展示用 alloc/total，避免把 free 误读成占用。
     mem0_free, mem0_alloc, mem0_total = _mem_snapshot()
     mem_min = mem0_free
@@ -157,6 +189,16 @@ def main():
     snapshot_fail_streak = 0
     detection = None
     img = None
+    # 阶段 C 每帧维护的最新几何状态（在 detector.process 之后填充，所有
+    # render_overlay / 5s 日志路径都消费同一份）。
+    arc_result = None
+    line_result = None
+    arc_mode = "none"
+    e_y_filt_mm = 0.0
+    psi_e_filt_mrad = 0.0
+    e_y_age = 0
+    psi_e_age = 0
+    q_full = 0.0
     # 文字 / FPS / 内存等行 1Hz 由 maybe_update_fps 触发更新；
     # binary overlay 由 maybe_update_binary 独立频率触发。
     # render_overlay 始终用最新 detection + 最近一次缓存的 lines 整体重画，
@@ -193,6 +235,64 @@ def main():
             photometric.update(img, now)
             detection = detector.process(img, photometric.threshold)
 
+            # 阶段 C 主算法：IPM → RANSAC 圆 / LSQ 直线 fallback → EMA → Q_full
+            arc_result = None
+            line_result = None
+            arc_mode = "none"
+            err_valid = False
+            e_y_raw_mm = 0.0
+            psi_e_raw_mrad = 0.0
+            if calib_mode != "none":
+                gp_list = mapper.bands_to_ground(detection.bands)
+                valid_pts = [
+                    (gp.x_g_mm, gp.y_g_mm) for gp in gp_list if gp.valid
+                ]
+                if len(valid_pts) >= config.RANSAC_MIN_SAMPLES:
+                    arc_result = fit_circle_ransac(valid_pts, config)
+                    if arc_result.succeeded:
+                        e_y_raw_mm, psi_e_raw_mrad, err_valid = (
+                            compute_path_errors_arc(arc_result, config)
+                        )
+                        arc_mode = "ransac"
+                    else:
+                        line_result = fit_line_lsq(valid_pts)
+                        if line_result.succeeded:
+                            e_y_raw_mm, psi_e_raw_mrad, err_valid = (
+                                compute_path_errors_line(line_result, config)
+                            )
+                            arc_mode = "lsq"
+                # else: 样本不足 → err_valid=False，下面 EMA 走 decay 分支
+            # EMA + 符号防抖：valid=False 时只衰减不喂新观测
+            e_y_filt_mm, psi_e_filt_mrad, e_y_age, psi_e_age = estimator.update(
+                e_y_raw_mm, psi_e_raw_mrad, err_valid
+            )
+            # Q_full：arc 缺失时 q_geom / q_r_prior=0；调用方仍可用 detection.q_l2 看 L2 子分。
+            q_full = compute_q_full(detection, arc_result, config)
+
+            # 填阶段 C 几何 OSD 状态（render_overlay 内部使用）
+            path_overlay.calib_mode = calib_mode
+            path_overlay.mapper = mapper if calib_mode != "none" else None
+            path_overlay.arc_mode = arc_mode
+            path_overlay.valid = err_valid
+            path_overlay.e_y_filt_mm = e_y_filt_mm
+            path_overlay.psi_e_filt_mrad = psi_e_filt_mrad
+            if arc_result is not None and arc_result.succeeded:
+                path_overlay.arc_xc = arc_result.xc
+                path_overlay.arc_yc = arc_result.yc
+                path_overlay.arc_R = arc_result.R
+                path_overlay.inlier_count = arc_result.inlier_count
+                path_overlay.sample_count = arc_result.sample_count
+            elif line_result is not None and line_result.succeeded:
+                path_overlay.line_cx = line_result.cx
+                path_overlay.line_cy = line_result.cy
+                path_overlay.line_tx = line_result.tx
+                path_overlay.line_ty = line_result.ty
+                path_overlay.inlier_count = 0
+                path_overlay.sample_count = line_result.sample_count
+            else:
+                path_overlay.inlier_count = 0
+                path_overlay.sample_count = 0
+
             if binary_button.poll(now):
                 enabled = not camera.binary_overlay_enabled()
                 if camera.set_binary_overlay_enabled(enabled):
@@ -202,7 +302,9 @@ def main():
                     )
                     overlay_lines = list(cached_lines)
                     overlay_lines.append((binary_event_text, config.OSD_ALERT_COLOR))
-                    camera.render_overlay(overlay_lines, detection=detection)
+                    camera.render_overlay(
+                        overlay_lines, detection=detection, path=path_overlay
+                    )
                     overlay_rendered = True
 
             # 采样落盘
@@ -253,23 +355,64 @@ def main():
                 )
                 lines = [(fps_text, fps_color)]
 
-                # 阶段 B：Q_L2 + 有效带数 + cx_near + 阈值
+                # 阶段 C 起 OSD line 2 改为 Q_full + 有效带数 + thr（cxN 信息
+                # 移到阶段 C 的 e_y 行，避免 Q 行长度溢出 OSD）。Q_full 在 calib
+                # 缺失时退化为 Q_L2 子集（geom + r_prior 项=0，自然降级到 lost）。
+                q_for_osd = q_full if calib_mode != "none" else detection.q_l2
                 q_color = None
-                if detection.q_l2 < config.Q_HOLD:
+                if q_for_osd < config.Q_HOLD:
                     q_color = config.OSD_ALERT_COLOR
                 lines.append((
-                    "Q %5.1f  V %d/%d  cxN %s  thr %d"
+                    "Q %5.1f  V %d/%d  thr %d"
                     % (
-                        detection.q_l2,
+                        q_for_osd,
                         detection.n_valid,
                         config.BAND_COUNT,
-                        ("%5.1f" % detection.cx_near_px)
-                        if detection.cx_near_px >= 0
-                        else "  -- ",
                         detection.threshold_used,
                     ),
                     q_color,
                 ))
+
+                # 阶段 C 路径误差行：calib_mode=="none" 时显示红色 NO CALIB；
+                # 否则显示 e_y / ψ_e / R̂ / inliers / arc_mode。
+                if calib_mode == "none":
+                    lines.append((
+                        "NO CALIB  (run tools/calibrate_ipm.py)",
+                        config.OSD_NO_CALIB_COLOR,
+                    ))
+                else:
+                    if not path_overlay.valid:
+                        path_text = (
+                            "e_y --     ψ --       R̂ --   in 0/%d  arc:%s"
+                            % (path_overlay.sample_count, arc_mode)
+                        )
+                        path_color = config.OSD_ALERT_COLOR
+                    elif arc_mode == "ransac":
+                        path_text = (
+                            "e_y %+5.0f mm  ψ %+5.0f mr  R̂ %3.0f mm  in %d/%d  arc:ransac"
+                            % (
+                                e_y_filt_mm, psi_e_filt_mrad,
+                                path_overlay.arc_R,
+                                path_overlay.inlier_count,
+                                path_overlay.sample_count,
+                            )
+                        )
+                        path_color = None
+                    else:  # lsq
+                        path_text = (
+                            "e_y %+5.0f mm  ψ %+5.0f mr  R̂ inf      n=%d  arc:lsq"
+                            % (
+                                e_y_filt_mm, psi_e_filt_mrad,
+                                path_overlay.sample_count,
+                            )
+                        )
+                        path_color = None
+                    lines.append((path_text, path_color))
+                    if calib_mode == "default":
+                        lines.append((
+                            "CALIB:DEFAULT (estimate, run calibrate_ipm.py)",
+                            config.OSD_CALIB_DEFAULT_COLOR,
+                        ))
 
                 if photometric.is_recalibrating:
                     lines.append((
@@ -319,7 +462,9 @@ def main():
                     overlay_lines.append((binary_event_text, config.OSD_ALERT_COLOR))
                 else:
                     overlay_lines = cached_lines
-                camera.render_overlay(overlay_lines, detection=detection)
+                camera.render_overlay(
+                    overlay_lines, detection=detection, path=path_overlay
+                )
                 overlay_rendered = True
             # ---- binary overlay 独立频率刷新（默认每帧）---- #
             elif (
@@ -330,7 +475,9 @@ def main():
                 # 用 1Hz 缓存的 lines 整体重画，避免 OSD 文字行抖动 / 缺失；
                 # binary overlay 内部只重画 ROI 内红色高亮 + 预览，开销
                 # ~10-30ms，不会拖累 algo FPS 低于 sensor 上限。
-                camera.render_overlay(overlay_lines, detection=detection)
+                camera.render_overlay(
+                    overlay_lines, detection=detection, path=path_overlay
+                )
 
             # 控制台日志节流：完整指标依然落日志，便于离线分析（plan §13.1）。
             if (
@@ -341,9 +488,20 @@ def main():
                 mem_drift_pct = (
                     100.0 * (mem_max - mem_min) / mem_max if mem_max > 0 else 0.0
                 )
+                # 阶段 C 起 Q 分级以 Q_full 为准；calib 缺失时退回 Q_L2 以
+                # 不让 Q_full 的 q_geom/q_r_prior=0 把日志一律打成 lost。
+                q_for_log = q_full if calib_mode != "none" else detection.q_l2
+                if arc_result is not None and arc_result.succeeded:
+                    arc_R_str = "%.0f" % arc_result.R
+                    in_str = "%d" % arc_result.inlier_count
+                else:
+                    arc_R_str = "  -"
+                    in_str = "0"
                 print(
                     "[VLT] algo_fps=%.1f period=%.1fms frames=%d "
                     "Q=%.1f(%s) V=%d/%d cxN=%.1f cxF=%.1f thr=%d "
+                    "e_y=%+.1fmm psi_e=%+.1fmrad R_hat=%s in=%s/%d arc=%s "
+                    "calib=%s%s "
                     "mu=%.1f sig=%.1f%s "
                     "mem_free=%d mem_alloc=%d mem_total=%d "
                     "(free_min=%d free_max=%d drift=%.1f%%)"
@@ -351,13 +509,21 @@ def main():
                         camera.algo_fps(),
                         camera.algo_period_ms(),
                         camera.frame_count(),
-                        detection.q_l2,
-                        q_grade(detection.q_l2),
+                        q_for_log,
+                        q_grade(q_for_log),
                         detection.n_valid,
                         config.BAND_COUNT,
                         detection.cx_near_px,
                         detection.cx_far_px,
                         detection.threshold_used,
+                        e_y_filt_mm,
+                        psi_e_filt_mrad,
+                        arc_R_str,
+                        in_str,
+                        path_overlay.sample_count,
+                        arc_mode,
+                        calib_mode,
+                        " HOLD(age=%d)" % e_y_age if (e_y_age > 0 and calib_mode != "none") else "",
                         photometric.mu_bg,
                         photometric.sigma_bg,
                         " RECAL" if photometric.is_recalibrating else "",
