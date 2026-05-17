@@ -123,7 +123,147 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 
 ---
 
-## 3. PC 端单测覆盖
+## 3. 硬件接线指引
+
+> 本节给出 Stage 4 两路 UART 的完整连线步骤，可直接作为装车检查清单使用。
+> 操作前务必**断开所有电源**。
+
+### 3.1 总体拓扑
+
+```
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  MS901M（ATK-MS901M，115200 8N1）                                     │
+  │  TX ─────────────────────────┬──→ MCU UART3_RX（已完成，MCU 侧接线）  │
+  │  GND ──────────────────┐     │                                        │
+  └────────────────────────│─────│────────────────────────────────────────┘
+                           │     │  Y 分线（直接短接或 100Ω 隔离电阻）
+                           │     └──→ K230 IO_20 (Header NO.5, UART1_RXD)
+                           │
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  MSPM0G3507 MCU                                                       │
+  │  UART1_TX / PB6 ─────────────→ K230 IO_6  (Header NO.20, UART2_RXD) │
+  │  UART1_RX / PB7 ←───────────── K230 IO_5  (Header NO.17, UART2_TXD) │
+  │  GND ──────────────────────────→ K230 GND  (Header NO.2/4/37)        │
+  └──────────────────────────────────────────────────────────────────────┘
+```
+
+**电平**：MS901M / MCU / K230 全部 3.3 V，直连兼容。  
+**禁止**：不得将 K230 的 5 V 电源（Header NO.1）接到 MCU 或 MS901M 的任何信号引脚。
+
+---
+
+### 3.2 K230 LP4 V3.0 使用引脚汇总
+
+> 引脚位置参考 `docs/k230_canmv_docs/pin/LP_PIN.md`，双排 40-pin Header。
+
+| Header NO. | 引脚标签 | 本项目用途 | 连接目标 |
+|:---:|---|---|---|
+| **2 / 4 / 37** | GND | 公共地 | MCU GND（任选一脚，建议靠近信号线的 NO.37） |
+| **5** | IO_20 | UART1_RXD（IMU 直通） | MS901M TX Y 分支路 |
+| **17** | UART2_TXD / IO_5 | UART2 TX → MCU RX | MCU PB7（UART1_RX） |
+| **20** | UART2_RXD / IO_6 | UART2 RX ← MCU TX | MCU PB6（UART1_TX） |
+
+> **UART 通道可用性**（K230 CanMV UART API 手册）：
+> - UART0：小核 SH 占用，**禁用**
+> - UART3：大核 SH 占用，**禁用**
+> - **UART1 / UART2 / UART4：用户可用**
+
+---
+
+### 3.3 链路一：MCU 命令链路（UART2，921600 baud，双向）
+
+| 线号 | K230 端 | K230 Header | 方向 | MCU 端 |
+|:---:|---|:---:|:---:|---|
+| ① | IO_5 (UART2_TXD) | **NO.17** | K230 → MCU | PB7 (UART1_RX) |
+| ② | IO_6 (UART2_RXD) | **NO.20** | MCU → K230 | PB6 (UART1_TX) |
+| ③ | GND | **NO.37** | 共地 | GND |
+
+**接线步骤**：
+1. 用杜邦线连接 K230 Header NO.17（IO_5）→ MCU PB7
+2. 用杜邦线连接 K230 Header NO.20（IO_6）← MCU PB6
+3. 用杜邦线连接 K230 Header NO.37（GND）→ MCU GND
+4. 用万用表核验：K230 GND 与 MCU GND 之间阻值 < 1 Ω（共地良好）
+
+---
+
+### 3.4 链路二：IMU 直通（UART1，115200 baud，仅 RX）
+
+MS901M TX 信号需 **Y 分**同时馈入 MCU UART3_RX 和 K230 UART1_RXD。
+
+| 线号 | K230 端 | K230 Header | 方向 | 来源 |
+|:---:|---|:---:|:---:|---|
+| ④ | IO_20 (UART1_RXD) | **NO.5** | MS901M → K230 | MS901M TX Y 分支路 |
+| — | — | — | — | MS901M TX → MCU UART3_RX（已完成） |
+
+**Y 分接法**：
+
+```
+MS901M TX ──┬──→ MCU UART3_RX（已有线）
+            │
+            └──→ K230 Header NO.5（IO_20）
+```
+
+短接距离 < 20 cm 时可直接短接；若导线较长（> 30 cm）建议在 K230 分支串联 **100 Ω** 隔离电阻，防止反射干扰 MCU 侧接收。
+
+> K230 侧无需接 MS901M RX（MS901M 单向推送，K230 只读不写）。
+
+---
+
+### 3.5 FPIOA 软件配置（由 `comms/uart_link.py` 自动完成）
+
+K230 CanMV 启动时 IO_20 默认为 GPIO，**必须通过 FPIOA 重映射为 UART1_RXD**；IO_5 / IO_6 在 LP4 板出厂时已映射为 UART2_TXD/RXD，但代码仍显式设置以防固件差异。
+
+`comms/uart_link.py` 中 `ImuLink.__init__` / `McuLink.__init__` 会在 `UART()` 打开前自动调用以下等效操作：
+
+```python
+from machine import FPIOA
+fpioa = FPIOA()
+
+# 链路二：UART1 RX（IMU，IO_20 = Header NO.5）
+fpioa.set_function(20, FPIOA.UART1_RXD)
+
+# 链路一：UART2 TX/RX（MCU 命令，IO_5/IO_6 = Header NO.17/NO.20）
+fpioa.set_function(5, FPIOA.UART2_TXD)
+fpioa.set_function(6, FPIOA.UART2_RXD)
+```
+
+引脚号由 `config.py` 统一管理，如需更换：
+
+```python
+# config.py（装车后如有冲突，修改此处即可）
+IMU_UART1_RX_IO  = 20   # 可改为 27/28/30/52/53 等空闲引脚
+MCU_UART2_TX_IO  = 5    # Header NO.17，通常不变
+MCU_UART2_RX_IO  = 6    # Header NO.20，通常不变
+```
+
+---
+
+### 3.6 上电前检查清单
+
+**硬件**
+
+- [ ] K230 Header NO.17（IO_5）→ MCU PB7，线序正确（TX→RX）
+- [ ] K230 Header NO.20（IO_6）← MCU PB6，线序正确（RX←TX）
+- [ ] K230 Header NO.37（GND）→ MCU GND，共地连接
+- [ ] K230 Header NO.5（IO_20）← MS901M TX Y 分支路
+- [ ] MS901M GND → MCU GND → K230 GND，三方共地
+- [ ] 无 5 V 电源接入 MCU / MS901M 信号引脚
+- [ ] 所有杜邦线插到位（轻拉不脱），无短路
+
+**软件**
+
+- [ ] `config.py` 中 `COMMS_ENABLE = True`
+- [ ] `config.py` 中 `IMU_UART_ID = 1`、`MCU_UART_ID = 2`（默认正确）
+- [ ] `config.py` 中 `IMU_UART1_RX_IO = 20`（或实际用的空闲引脚）
+- [ ] 运行 `vision_line_tracking.py`，启动日志应出现：
+  ```
+  [imu_link] UART1 @115200 RX=IO_20 opened
+  [mcu_link] UART2 @921600 TX=IO_5 RX=IO_6 opened
+  ```
+
+---
+
+## 4. PC 端单测覆盖
 
 | 模块 | 测试场景 | 通过判据 |
 |------|----------|----------|
@@ -135,7 +275,7 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 
 ---
 
-## 4. 验收记录占位（板端联调后回填）
+## 5. 验收记录占位（板端联调后回填）
 
 > 阶段 D 验收（plan §12）：
 > - 10 min 连续运行，UART 帧丢帧率 ≤ 0.1%（good / (good+bad) ≥ 99.9%）；
@@ -161,7 +301,7 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 
 ---
 
-## 5. 已知问题与遗留 TODO
+## 6. 已知问题与遗留 TODO
 
 - [ ] **`flags` 位域未打包进 MOTION_CMD**：plan §1.3 / §10.6 里 `flags(uint8)` 含 `degrade`/`lost`/`calib_change` 位。当前 `make_motion_cmd` 仅含 `(v, omega, mode)`（5 字节）；MCU 侧 VEHICLE_STATUS 解析时也只看这三字段。Stage E 控制律接入后需要在 MOTION_CMD 末尾增加 `flags` 字节，同步更新 `protocol.py` 和 MCU 侧帧解析代码。
 - [ ] **`seq` 帧序号未实现**：plan §1.3 的 `seq(uint16)` 供主控检测丢帧。当前未打包；Stage E 时补入。
@@ -173,7 +313,7 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 
 ---
 
-## 6. 进入下一阶段的前置条件
+## 7. 进入下一阶段的前置条件
 
 **代码侧已可进入阶段 E**（controller 前馈 + 反馈 + 限幅）。下列实测项不阻塞代码推进，但**装车联调前**必须完成：
 
@@ -183,7 +323,7 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 
 ---
 
-## 7. 给阶段 E 的接力条目
+## 8. 给阶段 E 的接力条目
 
 - **控制律输出**（plan §12 阶段 E）：Stage E `controller.py` 输出的 `(v_ref_mm_s, omega_ref_mrads)` 需要转换为 `MOTION_CMD` 的 `(target_v, target_omega)` 单位：
   - `target_v = v_ref_mm_s / WHEEL_CIRC_MM * ENCODER_CPR / MOTION_SCALE`（由运动学参数决定，当前用 SCALE=10）
@@ -197,9 +337,9 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 
 ---
 
-## 8. 日志与 OSD 字段含义速查（阶段 D 增量）
+## 9. 日志与 OSD 字段含义速查（阶段 D 增量）
 
-### 8.1 主循环 5 s 日志新增字段
+### 9.1 主循环 5 s 日志新增字段
 
 ```
 [VLT] ... mcu=ON bat=11250mV cps=+0 imu_g=200/b=0 mcu_g=50/b=0 ...
@@ -213,7 +353,7 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 | `imu_g/b` | 帧数 | MS901M 解析好帧 / 坏帧 | bad 占比 < 0.1% |
 | `mcu_g/b` | 帧数 | MCU 命令帧好帧 / 坏帧 | bad 占比 < 0.1% |
 
-### 8.2 OSD 文本行（阶段 D 增量，约 1Hz 更新）
+### 9.2 OSD 文本行（阶段 D 增量，约 1Hz 更新）
 
 ```
 MCU:ON   bat:11250mV  cps:+0
@@ -223,8 +363,9 @@ MCU 离线时该行标红显示 `MCU:OFF`。
 
 ---
 
-## 9. 变更日志
+## 10. 变更日志
 
 | 日期 | 版本 | 内容 |
 |------|------|------|
 | 2026-05-17 | phaseD-0.1 | 初版：comms/ 四模块 + vision_line_tracking.py 集成 + tools/uart_dump.py |
+| 2026-05-18 | phaseD-0.1 | 补充 §3 硬件接线指引：拓扑图、引脚汇总表、FPIOA 代码说明、上电前检查清单 |
