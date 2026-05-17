@@ -1,4 +1,4 @@
-"""K230 视觉循迹主入口（阶段 A 采集 + 阶段 B 多扫描带 + 阶段 C IPM/RANSAC/EMA）。
+"""K230 视觉循迹主入口（A 采集 + B 多扫描带 + C IPM/RANSAC/EMA + D UART 通讯）。
 
 本文件**只负责装配**，不写算法细节（plan §11.3）。
 
@@ -8,21 +8,21 @@
 ``vision.line_detector`` 每帧 L0 + (可选 L1) + L2 → 5 条扫描带 cx / mass /
 width / valid + Q_L2 评分。
 
-阶段 C（新增）：
-- ``vision.ground_mapper.GroundMapper`` 把 5 条带 cx 通过 IPM 单应矩阵映射
-  到地面坐标 (mm)；``calib.json`` 缺失时用 plan §4.1 安装几何反推占位 H，
-  OSD 标 ``CALIB:DEFAULT``；占位都失败时跳过几何，OSD 显示 ``NO CALIB``。
-- ``vision.geometry.fit_circle_ransac`` 枚举 RANSAC 圆弧拟合（半径先验
-  ``409 ± 50 mm``）；失败 fallback 到 ``fit_line_lsq`` 一阶 TLS 直线。
-- ``vision.geometry.compute_path_errors_*`` 给出 plan §1.3 契约的 ``e_y_mm``
-  / ``ψ_e_mrad``（符号约定见 ``vision/geometry.py`` docstring）。
-- ``vision.estimator.PathErrorEstimator`` 跑 EMA (α=0.5) + 符号防抖 (3 帧)。
-- ``vision.quality.compute_q_full`` 给 plan §6.6 全权重 Q (mass + geom + cont
-  + r_prior)；阶段 B 的 Q_L2 仍可由 ``detection.q_l2`` 读到。
-- OSD 文本行扩展 + 几何叠加 (5 点 cx 折线 / 圆心反投 / 切线箭头)。
-- 5 s 控制台日志加 ``e_y_filt / psi_e_filt / R_hat / inliers / arc_mode / calib``。
+阶段 C（继承）：
+- ``vision.ground_mapper.GroundMapper`` IPM 单应矩阵，``calib.json`` 缺失时
+  用安装几何推导占位 H（OSD 标 ``CALIB:DEFAULT``）。
+- RANSAC 圆弧拟合 + LSQ 直线 fallback → ``e_y_mm`` / ``ψ_e_mrad``。
+- ``vision.estimator.PathErrorEstimator`` EMA (α=0.5) + 符号防抖 (3 帧)。
+- ``vision.quality.compute_q_full`` plan §6.6 全权重 Q。
 
-后续阶段（D 起）将追加：``comms`` (UART) → ``controller``。
+阶段 D（新增）：
+- ``comms.ImuLink``：UART(1, 115200) 直接读 MS901M 200 Hz 姿态数据，
+  供云台前馈补偿（Stage E 起正式消费）。
+- ``comms.McuLink``：UART(2, 921600) 双向通讯，40 Hz 发 MOTION_CMD，
+  400 ms 心跳，500 ms 超时降级，OSD / 日志追加 MCU 在线状态。
+- ``config.COMMS_ENABLE=False`` 时全部 UART 跳过（bench 调试兼容）。
+
+后续阶段（E 起）将追加：``controller``（前馈 + 反馈 + 限幅）。
 """
 
 import gc
@@ -45,6 +45,7 @@ from vision.geometry import (
 )
 from vision.estimator import PathErrorEstimator
 from vision.debug_overlay import PathOverlayInfo
+from comms.uart_link import ImuLink, McuLink
 
 
 def _ensure_dir(path):
@@ -104,6 +105,41 @@ def _mem_snapshot():
         alloc = -1
     total = free + alloc if free >= 0 and alloc >= 0 else -1
     return free, alloc, total
+
+
+def _setup_comms(cfg):
+    """初始化双路 UART 链路。
+
+    ``cfg.COMMS_ENABLE=False`` 时直接返回 (None, None)（bench 调试用）。
+    任何初始化异常都捕获并打印，返回 (None, None) 不中断启动。
+    """
+    if not getattr(cfg, "COMMS_ENABLE", False):
+        print("[VLT] COMMS_ENABLE=False, skipping UART init (bench mode)")
+        return None, None
+    try:
+        from comms.ms901m import MS901MParser
+        from comms.frame   import MCUFrameParser
+        if not MS901MParser.self_test():
+            print("[VLT] MS901MParser self_test FAILED; comms disabled")
+            return None, None
+        if not MCUFrameParser.self_test():
+            print("[VLT] MCUFrameParser self_test FAILED; comms disabled")
+            return None, None
+        imu_link = ImuLink(uart_id=getattr(cfg, "IMU_UART_ID", 1))
+        mcu_link = McuLink(
+            uart_id   = getattr(cfg, "MCU_UART_ID", 2),
+            timeout_ms= getattr(cfg, "MCU_TIMEOUT_MS", 500),
+        )
+        print("[VLT] comms init OK (IMU UART%d, MCU UART%d)"
+              % (getattr(cfg, "IMU_UART_ID", 1), getattr(cfg, "MCU_UART_ID", 2)))
+        return imu_link, mcu_link
+    except Exception as e:
+        print("[VLT] comms init failed: %s" % e)
+        try:
+            sys.print_exception(e)
+        except Exception:
+            pass
+        return None, None
 
 
 def main():
@@ -177,6 +213,9 @@ def main():
     path_overlay.calib_mode = calib_mode
     path_overlay.mapper = mapper if calib_mode != "none" else None
 
+    # 阶段 D：UART 通讯初始化（COMMS_ENABLE=False 时返回 None, None）
+    imu_link, mcu_link = _setup_comms(config)
+
     # 内存监测：泄漏看 free 的震荡；OSD 展示用 alloc/total，避免把 free 误读成占用。
     mem0_free, mem0_alloc, mem0_total = _mem_snapshot()
     mem_min = mem0_free
@@ -189,6 +228,11 @@ def main():
     snapshot_fail_streak = 0
     detection = None
     img = None
+
+    # 阶段 D：通讯调度时间戳与状态缓存
+    last_cmd_ms = time.ticks_ms()
+    last_hb_ms  = time.ticks_ms()
+    mcu_online  = False   # 上一次 is_online 结果（用于 OSD 避免每帧求值）
     # 阶段 C 每帧维护的最新几何状态（在 detector.process 之后填充，所有
     # render_overlay / 5s 日志路径都消费同一份）。
     arc_result = None
@@ -221,6 +265,14 @@ def main():
             ):
                 binary_event_text = None
                 overlay_lines = cached_lines
+
+            # 阶段 D：drain 两路 UART（在 snapshot 前做，利用 snapshot 阻塞
+            # 期间 UART 缓冲积累的数据，降低端到端延迟）。
+            if imu_link is not None:
+                imu_link.drain()
+            if mcu_link is not None:
+                mcu_link.drain(now)
+                mcu_online = mcu_link.is_online(now)
 
             img = camera.read_algo_frame()
             if img is None:
@@ -292,6 +344,27 @@ def main():
             else:
                 path_overlay.inlier_count = 0
                 path_overlay.sample_count = 0
+
+            # 阶段 D：定时发送 MOTION_CMD（40 Hz）与 HEARTBEAT_K230（~2.5 Hz）
+            if mcu_link is not None:
+                if time.ticks_diff(now, last_cmd_ms) >= config.CMD_SEND_INTERVAL_MS:
+                    last_cmd_ms = now
+                    # Stage E 前 target_v / omega 由 config 占位值给出（均为 0）；
+                    # Stage E 控制律落地后替换为控制律输出。
+                    target_v     = getattr(config, "MOTION_DEFAULT_V", 0)
+                    target_omega = getattr(config, "MOTION_DEFAULT_OMEGA", 0)
+                    # 低电量减速：bat_mv 低于阈值时限制 target_v
+                    bat_mv   = mcu_link.vehicle_bat_mv
+                    bat_degrade_mv  = getattr(config, "BAT_DEGRADE_MV", 9500)
+                    bat_degrade_max = getattr(config, "BAT_DEGRADE_V_MAX", 200)
+                    if bat_mv > 0 and bat_mv < bat_degrade_mv:
+                        if abs(target_v) > bat_degrade_max:
+                            target_v = bat_degrade_max if target_v > 0 else -bat_degrade_max
+                    mcu_link.send_motion(target_v, target_omega)
+
+                if time.ticks_diff(now, last_hb_ms) >= config.HB_SEND_INTERVAL_MS:
+                    last_hb_ms = now
+                    mcu_link.send_heartbeat(now)
 
             if binary_button.poll(now):
                 enabled = not camera.binary_overlay_enabled()
@@ -414,6 +487,17 @@ def main():
                             config.OSD_CALIB_DEFAULT_COLOR,
                         ))
 
+                # 阶段 D：MCU 在线状态行（COMMS_ENABLE=False 时跳过）
+                if mcu_link is not None:
+                    bat_mv_now = mcu_link.vehicle_bat_mv
+                    mcu_status_text = "MCU:%s  bat:%dmV  cps:%+d" % (
+                        "ON " if mcu_online else "OFF",
+                        bat_mv_now,
+                        mcu_link.vehicle_avg_cps,
+                    )
+                    mcu_color = None if mcu_online else config.OSD_ALERT_COLOR
+                    lines.append((mcu_status_text, mcu_color))
+
                 if photometric.is_recalibrating:
                     lines.append((
                         "PHOTO recal %d/%d"
@@ -497,12 +581,29 @@ def main():
                 else:
                     arc_R_str = "  -"
                     in_str = "0"
+                # 阶段 D：MCU 链路统计
+                if mcu_link is not None:
+                    mcu_good, mcu_bad = mcu_link.stats()
+                    mcu_log_str = (
+                        " mcu=%s bat=%dmV cps=%+d imu_g=%d/b=%d mcu_g=%d/b=%d"
+                        % (
+                            "ON" if mcu_online else "OFF",
+                            mcu_link.vehicle_bat_mv,
+                            mcu_link.vehicle_avg_cps,
+                            imu_link.stats()[0] if imu_link is not None else 0,
+                            imu_link.stats()[1] if imu_link is not None else 0,
+                            mcu_good,
+                            mcu_bad,
+                        )
+                    )
+                else:
+                    mcu_log_str = ""
                 print(
                     "[VLT] algo_fps=%.1f period=%.1fms frames=%d "
                     "Q=%.1f(%s) V=%d/%d cxN=%.1f cxF=%.1f thr=%d "
                     "e_y=%+.1fmm psi_e=%+.1fmrad R_hat=%s in=%s/%d arc=%s "
                     "calib=%s%s "
-                    "mu=%.1f sig=%.1f%s "
+                    "mu=%.1f sig=%.1f%s%s "
                     "mem_free=%d mem_alloc=%d mem_total=%d "
                     "(free_min=%d free_max=%d drift=%.1f%%)"
                     % (
@@ -527,6 +628,7 @@ def main():
                         photometric.mu_bg,
                         photometric.sigma_bg,
                         " RECAL" if photometric.is_recalibrating else "",
+                        mcu_log_str,
                         last_mem_free,
                         last_mem_alloc,
                         last_mem_total,
@@ -559,6 +661,12 @@ def main():
         except Exception:
             pass
     finally:
+        # 阶段 D：向 MCU 发一帧停止指令后再关闭（尽力而为，失败不阻塞）
+        if mcu_link is not None:
+            try:
+                mcu_link.send_stop()
+            except Exception:
+                pass
         camera.stop()
         try:
             os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)

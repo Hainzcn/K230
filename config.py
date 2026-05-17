@@ -10,7 +10,7 @@
 - 标定结果统一存放在 ``calib.json``，由 :func:`load_calibration` 在启动期载入。
 """
 
-CONFIG_VERSION = "phaseC-0.1"
+CONFIG_VERSION = "phaseD-0.1"
 
 # ---------------------------------------------------------------------------
 # 显示设备
@@ -497,6 +497,48 @@ OSD_NO_CALIB_COLOR = (255, 0, 0)         # NO CALIB 文字（纯红）
 CALIB_PATH = "/sdcard/calib.json"
 # 阶段 B 的独立光度标定脚本写盘路径（plan §11.1 tools/）。不污染 calib.json。
 PHOTO_CALIB_PATH = "/sdcard/calib_photometric.json"
+
+
+# ---------------------------------------------------------------------------
+# 阶段 D：UART 链路（plan §10）
+# ---------------------------------------------------------------------------
+# COMMS_ENABLE=False 时主循环跳过所有 UART 初始化（bench 桌面调试用）。
+# 装车后设 True，同时确认 IMU_UART_ID / MCU_UART_ID 与硬件接线一致。
+#
+# 接线（Stage4-K230-Side.md §1）：
+#   UART(1, 115200) RX ← MS901M TX 线 Y 分支路
+#   UART(2, 921600) TX → MCU PB7 RX；RX ← MCU PB6 TX
+#   共 GND（MCU GND → K230 GND），严禁互接 5V 电源
+# ---------------------------------------------------------------------------
+COMMS_ENABLE = False          # bench 关闭，装车设 True
+
+IMU_UART_ID  = 1              # UART(1) 115200，接 MS901M TX Y 分线（仅 RX）
+MCU_UART_ID  = 2              # UART(2) 921600，接 MCU UART1（TX+RX 双向）
+
+# MCU 心跳超时：超过此时长未收到 HEARTBEAT_MCU → K230 进入降级（发 mode=0）
+# plan §2.2 规定 MCU 侧 200 ms 未收 MOTION_CMD 就平衡保护；K230 侧放宽到
+# 500 ms 触发降级，给通讯抖动预留余量。
+MCU_TIMEOUT_MS = 500
+
+# K230 → MCU 心跳发送间隔（ms）：必须 < MCU_TIMEOUT_MS。
+# MCU 侧如果 500 ms 内收不到任何帧就归零；心跳按 400 ms 发，留 100 ms 裕量。
+HB_SEND_INTERVAL_MS = 400
+
+# MOTION_CMD 发送频率：25 ms = 40 Hz（plan §4.2 K230→MCU 20~50 Hz）。
+CMD_SEND_INTERVAL_MS = 25
+
+# 低电量减速阈值：bat_mv 低于该值时 K230 把 target_v 钳位到 v_degrade，
+# 对应 MCU 侧 LOW_BAT_WARN 提前量，减少紧急停车风险（Stage4 §6 规则）。
+BAT_DEGRADE_MV = 9500
+
+# 低电量时纵向速度上限（counts/s / SCALE；同 MOTION_CMD target_v 单位）。
+BAT_DEGRADE_V_MAX = 200
+
+# MOTION_CMD 目标速度 / 转向默认值（Stage E 控制律落地前占位）。
+# target_v     : 0 = 原地平衡，Stage E 后由控制律填充
+# target_omega : 0 = 不转向
+MOTION_DEFAULT_V     = 0
+MOTION_DEFAULT_OMEGA = 0
 
 
 def get(key, default=None):
