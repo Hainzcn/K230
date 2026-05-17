@@ -168,6 +168,7 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 - [ ] **IMU 前馈尚未消费**：`ImuLink.pitch_deg()` 已可读，但 Stage E 前 target_v/omega=0，云台前馈补偿（plan §3.3 / §5.1）留待 Stage E 实现。
 - [ ] **target_v / omega 占位为 0**：当前 `MOTION_DEFAULT_V=0` / `MOTION_DEFAULT_OMEGA=0`，实际行驶需要 Stage E 控制律填充（plan §12 阶段 E）。
 - [ ] **calib.json schema 版本与 CONFIG_VERSION 联调**：plan §5 TODO 延续到阶段 D——`phaseD-0.1` 改变了 CONFIG_VERSION，若旧版 calib.json 仍在 SD 卡，需确认 `config.load_calibration` 的版本警告不影响 IPM 正常运行（目前仅 warn，不拒绝）。
+- [ ] **UART1 RX IO 引脚待装车确认**：当前 `IMU_UART1_RX_IO=20`（LP Header NO.5，空闲引脚），装车后若 IO_20 与其他外设冲突，改 `config.py` 中 `IMU_UART1_RX_IO` 为另一空闲引脚（IO_27/28/30/52/53），FPIOA 配置会自动跟随。
 - [ ] **`MCU_TIMEOUT_MS` 与 `HB_SEND_INTERVAL_MS` 装车微调**：当前 500 ms / 400 ms 是理论值，实测 UART 抖动可能需要放宽到 600 ms / 450 ms，或在 Stage E 根据 K230 主循环实际帧周期（~30 ms）重新评估。
 
 ---

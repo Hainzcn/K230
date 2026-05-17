@@ -9,6 +9,15 @@ McuLink  — UART(2, 921600)，双向，与 MSPM0G3507 MCU UART1 互联。
 
 import time
 
+# MicroPython 兼容：CPython 无 ticks_ms / ticks_diff，用 time.monotonic_ns 模拟
+if not hasattr(time, "ticks_ms"):
+    def _ticks_ms():
+        return int(time.monotonic_ns() // 1_000_000)
+    def _ticks_diff(new, old):
+        return new - old
+    time.ticks_ms   = _ticks_ms
+    time.ticks_diff = _ticks_diff
+
 from comms.ms901m import MS901MParser
 from comms.frame  import MCUFrameParser
 from comms.protocol import (
@@ -23,27 +32,76 @@ from comms.protocol import (
 )
 
 # ---------------------------------------------------------------------------
-# UART 懒加载（兼容 bench 环境）
+# FPIOA + UART 懒加载（兼容 bench 环境）
 # ---------------------------------------------------------------------------
+# K230 可用 UART：UART1 / UART2 / UART4
+# （UART0=小核SH占用，UART3=大核SH占用，切勿使用）
+# UART 引脚通过 FPIOA.set_function() 分配；LP 板出厂已将 IO_5/IO_6 默认
+# 映射到 UART2_TXD/RXD，但显式设置更安全，且 UART1 必须显式配置。
 
-def _try_import_uart():
-    """尝试导入 machine.UART；bench 环境返回 None。"""
+def _try_import_machine():
+    """尝试导入 machine 模块；bench 环境返回 (None, None)。"""
     try:
-        from machine import UART
-        return UART
+        from machine import UART, FPIOA
+        return UART, FPIOA
     except ImportError:
-        return None
+        return None, None
 
 
-_UART_CLASS = _try_import_uart()
+_UART_CLASS, _FPIOA_CLASS = _try_import_machine()
+
+# UART 通道号常量映射（UART.UART1 / UART.UART2 等值在 K230 MicroPython 中
+# 等于整数 1 / 2，但通过属性取值更明确，且 bench 下退回整数 fallback）
+_UART_ID_MAP = {}
+if _UART_CLASS is not None:
+    _UART_ID_MAP = {
+        1: getattr(_UART_CLASS, "UART1", 1),
+        2: getattr(_UART_CLASS, "UART2", 2),
+        4: getattr(_UART_CLASS, "UART4", 4),
+    }
+
+
+def _fpioa_setup_uart2(tx_io=5, rx_io=6):
+    """配置 UART2 TX/RX FPIOA 映射（MCU 命令链路）。
+
+    LP 板出厂：IO_5=UART2_TXD (Header NO.17)，IO_6=UART2_RXD (Header NO.20)。
+    """
+    if _FPIOA_CLASS is None:
+        return
+    try:
+        fpioa = _FPIOA_CLASS()
+        fpioa.set_function(tx_io, getattr(_FPIOA_CLASS, "UART2_TXD"))
+        fpioa.set_function(rx_io, getattr(_FPIOA_CLASS, "UART2_RXD"))
+    except Exception as e:
+        print("[uart_link] FPIOA UART2 setup failed: %s" % e)
+
+
+def _fpioa_setup_uart1_rx(rx_io=20):
+    """配置 UART1 RX FPIOA 映射（IMU 直通，仅 RX）。
+
+    LP 板推荐：IO_20 (Header NO.5，空闲引脚)。
+    """
+    if _FPIOA_CLASS is None:
+        return
+    try:
+        fpioa = _FPIOA_CLASS()
+        fpioa.set_function(rx_io, getattr(_FPIOA_CLASS, "UART1_RXD"))
+    except Exception as e:
+        print("[uart_link] FPIOA UART1 RX setup failed: %s" % e)
 
 
 def _open_uart(uart_id, baudrate):
     """创建并返回 UART 实例；machine 不可用时返回 None。"""
     if _UART_CLASS is None:
         return None
+    hw_id = _UART_ID_MAP.get(uart_id, uart_id)
     try:
-        return _UART_CLASS(uart_id, baudrate=baudrate, bits=8, parity=None, stop=1)
+        return _UART_CLASS(
+            hw_id, baudrate=baudrate,
+            bits=_UART_CLASS.EIGHTBITS,
+            parity=_UART_CLASS.PARITY_NONE,
+            stop=_UART_CLASS.STOPBITS_ONE,
+        )
     except Exception as e:
         print("[uart_link] open UART(%d, %d) failed: %s" % (uart_id, baudrate, e))
         return None
@@ -62,13 +120,21 @@ class ImuLink:
     BAUD = 115200
     READ_BYTES = 64      # 200 Hz 时每 5 ms 约 ~72 B；每帧读 64 B 足够
 
-    def __init__(self, uart_id=1):
+    def __init__(self, uart_id=1, rx_io=20):
+        """
+        Args:
+            uart_id: UART 通道号（K230 可用：1 / 2 / 4）
+            rx_io:   FPIOA RX 引脚号（默认 IO_20，Header NO.5）
+        """
         self._parser = MS901MParser()
+        # FPIOA：将指定 IO 配置为 UART1_RXD（仅 RX，不分配 TX）
+        if uart_id == 1:
+            _fpioa_setup_uart1_rx(rx_io)
         self._uart   = _open_uart(uart_id, self.BAUD)
         if self._uart is None:
             print("[imu_link] bench mode (no UART)")
         else:
-            print("[imu_link] UART(%d, %d) opened" % (uart_id, self.BAUD))
+            print("[imu_link] UART%d @%d RX=IO_%d opened" % (uart_id, self.BAUD, rx_io))
 
     def drain(self):
         """读取 UART RX 缓冲并喂给解析器。主循环每帧调用一次。"""
@@ -113,9 +179,15 @@ class McuLink:
     BAUD       = 921600
     READ_BYTES = 128
 
-    def __init__(self, uart_id=2, timeout_ms=500):
+    def __init__(self, uart_id=2, timeout_ms=500, tx_io=5, rx_io=6):
+        """
+        Args:
+            uart_id:    UART 通道号（K230 可用：1 / 2 / 4）
+            timeout_ms: MCU 心跳超时阈值
+            tx_io:      FPIOA TX 引脚号（默认 IO_5，Header NO.17 = UART2_TXD）
+            rx_io:      FPIOA RX 引脚号（默认 IO_6，Header NO.20 = UART2_RXD）
+        """
         self._parser   = MCUFrameParser()
-        self._uart     = _open_uart(uart_id, self.BAUD)
         self._timeout_ms = timeout_ms
         self._last_hb_ms = time.ticks_ms()
 
@@ -123,10 +195,16 @@ class McuLink:
         self.vehicle_safety  = SAFETY_DISARMED
         self.vehicle_bat_mv  = 0
 
+        # FPIOA：先配置引脚再打开 UART（LP 板默认已映射，显式设置更安全）
+        if uart_id == 2:
+            _fpioa_setup_uart2(tx_io, rx_io)
+
+        self._uart = _open_uart(uart_id, self.BAUD)
         if self._uart is None:
             print("[mcu_link] bench mode (no UART)")
         else:
-            print("[mcu_link] UART(%d, %d) opened" % (uart_id, self.BAUD))
+            print("[mcu_link] UART%d @%d TX=IO_%d RX=IO_%d opened"
+                  % (uart_id, self.BAUD, tx_io, rx_io))
 
     # ------------------------------------------------------------------
     # 接收

@@ -512,8 +512,29 @@ PHOTO_CALIB_PATH = "/sdcard/calib_photometric.json"
 # ---------------------------------------------------------------------------
 COMMS_ENABLE = False          # bench 关闭，装车设 True
 
-IMU_UART_ID  = 1              # UART(1) 115200，接 MS901M TX Y 分线（仅 RX）
-MCU_UART_ID  = 2              # UART(2) 921600，接 MCU UART1（TX+RX 双向）
+# UART 通道号（可用：UART1 / UART2 / UART4；UART0=小核SH，UART3=大核SH，不可用）
+IMU_UART_ID  = 1              # UART1  115200，接 MS901M TX Y 分线（仅 RX）
+MCU_UART_ID  = 2              # UART2  921600，接 MCU UART1（TX+RX 双向）
+
+# ---------------------------------------------------------------------------
+# FPIOA 引脚映射（LP_PIN.md 及 IOMUX 手册）
+#
+# UART2（MCU 命令链路，Header NO.17 / NO.20）：
+#   IO_5  = UART2_TXD  ← K230 发 → MCU RX (MCU PB7)
+#   IO_6  = UART2_RXD  ← MCU TX (MCU PB6) → K230 收
+#
+# UART1（IMU 直通，仅 RX，Header NO.5 IO_20 复用）：
+#   IO_20 = UART1_RXD  ← MS901M TX Y 分线
+#   TX 引脚不分配（MS901M 单向推送，无需发送）
+#
+# 注：K230 CanMV LP 板上 IO_20 在 Header NO.5，无其他专属功能，
+# 是 UART1 RX 的推荐自由引脚之一。装车后若该引脚有冲突，可改为
+# IO_27/IO_28/IO_30/IO_52/IO_53 等同等级空闲引脚，同步修改 FPIOA
+# 配置即可（仅需改此处常量）。
+# ---------------------------------------------------------------------------
+MCU_UART2_TX_IO  = 5          # IO_5  → UART2_TXD (Header NO.17)
+MCU_UART2_RX_IO  = 6          # IO_6  → UART2_RXD (Header NO.20)
+IMU_UART1_RX_IO  = 20         # IO_20 → UART1_RXD (Header NO.5，推荐空闲引脚)
 
 # MCU 心跳超时：超过此时长未收到 HEARTBEAT_MCU → K230 进入降级（发 mode=0）
 # plan §2.2 规定 MCU 侧 200 ms 未收 MOTION_CMD 就平衡保护；K230 侧放宽到

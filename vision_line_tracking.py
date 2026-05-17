@@ -125,10 +125,15 @@ def _setup_comms(cfg):
         if not MCUFrameParser.self_test():
             print("[VLT] MCUFrameParser self_test FAILED; comms disabled")
             return None, None
-        imu_link = ImuLink(uart_id=getattr(cfg, "IMU_UART_ID", 1))
+        imu_link = ImuLink(
+            uart_id = getattr(cfg, "IMU_UART_ID", 1),
+            rx_io   = getattr(cfg, "IMU_UART1_RX_IO", 20),
+        )
         mcu_link = McuLink(
-            uart_id   = getattr(cfg, "MCU_UART_ID", 2),
-            timeout_ms= getattr(cfg, "MCU_TIMEOUT_MS", 500),
+            uart_id    = getattr(cfg, "MCU_UART_ID", 2),
+            timeout_ms = getattr(cfg, "MCU_TIMEOUT_MS", 500),
+            tx_io      = getattr(cfg, "MCU_UART2_TX_IO", 5),
+            rx_io      = getattr(cfg, "MCU_UART2_RX_IO", 6),
         )
         print("[VLT] comms init OK (IMU UART%d, MCU UART%d)"
               % (getattr(cfg, "IMU_UART_ID", 1), getattr(cfg, "MCU_UART_ID", 2)))
