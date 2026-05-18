@@ -424,6 +424,33 @@ while True:
 
 ## 7. 调试方法
 
+### 7.0 K230 运行日志判读
+
+K230 主循环每 5 s 会打印 MCU 链路统计。若出现类似：
+
+```text
+mcu=ON/OFF ... mcu_g=15/b=617 uart_rx=9390B
+```
+
+先看 `uart_rx`。若 30 s 约 9.3 KB，说明 UART2 实际收到了 MCU 上行流：
+
+- `VEHICLE_STATUS`：20 Hz × 15 B = 300 B/s；
+- `HEARTBEAT_MCU`：1 Hz × 12 B = 12 B/s；
+- 合计约 312 B/s。
+
+这时问题通常不是接线/波特率完全错误，而是帧解析不一致。K230 会继续打印：
+
+```text
+mcu_bad=lenX/t1Y/t2Z/crcW last=reason:Lxx:Cyy:rx/calc
+```
+
+判读规则：
+
+- `crc` 高：核对 MCU 侧 CRC16-CCITT 参数、校验范围是否为 `LEN + CMD + PAYLOAD`，以及 CRC 是否低字节在前；
+- `tail1/tail2` 高：核对帧尾是否严格为 `55 AA`，并检查是否多发/少发字节；
+- `len` 高：核对 `LEN` 是否只表示 payload 长度，不包含 CMD/CRC/帧尾；
+- `last` 中 `C01` 长期出现而 heartbeat 偶尔通过：重点检查 `VEHICLE_STATUS` 构帧。
+
 ### 7.1 单步验证 IMU 链路
 
 ```python

@@ -134,6 +134,24 @@ class DebugOverlay:
         # 节流：只在前 N 次 OSD 刷新打印诊断日志，避免长时间运行时刷屏。
         self._binary_dbg_remaining = 0
 
+    def _video_x(self):
+        return int(getattr(self.cfg, "SENSOR_DISPLAY_X", 0))
+
+    def _video_y(self):
+        return int(getattr(self.cfg, "SENSOR_DISPLAY_Y", 0))
+
+    def _video_w(self):
+        return int(getattr(self.cfg, "SENSOR_DISPLAY_W", self.cfg.DISPLAY_WIDTH))
+
+    def _video_h(self):
+        return int(getattr(self.cfg, "SENSOR_DISPLAY_H", self.cfg.DISPLAY_HEIGHT))
+
+    def _video_scale_x(self):
+        return self._video_w() / float(self.cfg.ALGO_WIDTH)
+
+    def _video_scale_y(self):
+        return self._video_h() / float(self.cfg.ALGO_HEIGHT)
+
     def set_osd(self, osd):
         self._osd = osd
 
@@ -143,10 +161,10 @@ class DebugOverlay:
             return
         try:
             roi_x, roi_y, roi_w, roi_h = self.cfg.ROI_TOTAL_PX
-            sx = self.cfg.DISPLAY_WIDTH / float(self.cfg.ALGO_WIDTH)
-            sy = self.cfg.DISPLAY_HEIGHT / float(self.cfg.ALGO_HEIGHT)
-            self._binary_dest_x = int(roi_x * sx)
-            self._binary_dest_y = int(roi_y * sy)
+            sx = self._video_scale_x()
+            sy = self._video_scale_y()
+            self._binary_dest_x = self._video_x() + int(roi_x * sx)
+            self._binary_dest_y = self._video_y() + int(roi_y * sy)
             self._binary_scale_x = sx
             self._binary_scale_y = sy
             # 右上角预览窗坐标：x=DISPLAY_W-roi_w-10, y=10。
@@ -158,12 +176,15 @@ class DebugOverlay:
             self._binary_dbg_remaining = 10
             print(
                 "[debug_overlay] binary overlay setup: overlay=%s preview=%s "
-                "mode=%s roi=%dx%d dest=(%d,%d) scale=(%.2f,%.2f) preview=(%d,%d)"
+                "mode=%s roi=%dx%d video=%dx%d@(%d,%d) "
+                "dest=(%d,%d) scale=(%.2f,%.2f) preview=(%d,%d)"
                 % (
                     self._binary_overlay_enabled,
                     self._binary_preview_enabled,
                     self._binary_overlay_mode,
                     roi_w, roi_h,
+                    self._video_w(), self._video_h(),
+                    self._video_x(), self._video_y(),
                     self._binary_dest_x, self._binary_dest_y,
                     sx, sy,
                     self._binary_preview_x, self._binary_preview_y,
@@ -369,7 +390,7 @@ class DebugOverlay:
         # 3. 切线箭头（从近带 cx 出发，朝切线方向）
         bands = detection.bands
         if bands and bands[-1].valid:
-            self._draw_tangent_arrow(mapper, path, bands[-1])
+            self._draw_tangent_arrow(mapper, path, bands)
 
     def _draw_band_polyline(self, bands):
         """连接 5 条带的 valid cx 形成绿色折线。"""
@@ -424,22 +445,97 @@ class DebugOverlay:
         self._osd.draw_line(sx_d, sy_d, ex_d, ey_d, color=color, thickness=2)
         self._draw_arrow_head(sx_d, sy_d, ex_d, ey_d, color)
 
-    def _draw_tangent_arrow(self, mapper, path, near_band):
+    def _band_ground_point(self, mapper, band):
+        """返回扫描带中心点的地面坐标；无效或映射失败时返回 None。"""
+        if band is None or not band.valid or band.cx_px < 0:
+            return None
+        cy = (band.y_top + band.y_bot) // 2
+        return mapper.pixel_to_ground(float(band.cx_px), float(cy))
+
+    def _band_pixel_point(self, band):
+        """返回扫描带中心点的算法像素坐标；无效时返回 None。"""
+        if band is None or not band.valid or band.cx_px < 0:
+            return None
+        cy = 0.5 * (float(band.y_top) + float(band.y_bot))
+        return float(band.cx_px), cy
+
+    def _forward_ref_from_pixels(self, bands):
+        """用屏幕上的近带到更远有效带方向估计可见中心线切线。"""
+        if not bands:
+            return None
+        p_near = self._band_pixel_point(bands[-1])
+        if p_near is None:
+            return None
+        x_n, y_n = p_near
+        for b in range(len(bands) - 2, -1, -1):
+            p_far = self._band_pixel_point(bands[b])
+            if p_far is None:
+                continue
+            dx = p_far[0] - x_n
+            dy = p_far[1] - y_n
+            norm = math.sqrt(dx * dx + dy * dy)
+            if norm > 1e-3:
+                return dx / norm, dy / norm
+        return None
+
+    def _forward_ref_from_bands(self, mapper, bands, p_near_g):
+        """用近带到更远有效带的向量估计当前可见弧线的前进方向。"""
+        if not bands or p_near_g is None:
+            return None
+        x_n, y_n = p_near_g
+        # bands: 0=远 -> N-1=近；从近带相邻的更远带开始找，优先局部方向。
+        for b in range(len(bands) - 2, -1, -1):
+            p_far_g = self._band_ground_point(mapper, bands[b])
+            if p_far_g is None:
+                continue
+            dx = p_far_g[0] - x_n
+            dy = p_far_g[1] - y_n
+            norm = math.sqrt(dx * dx + dy * dy)
+            if norm > 1e-3:
+                return dx / norm, dy / norm
+        return None
+
+    def _draw_tangent_arrow(self, mapper, path, bands):
         """从近带 cx 出发画橙色切线箭头，方向 = 当前 arc/line 切线在像素域的投影。
 
-        实现思路：在地面坐标系下从近带的地面点 P_near 沿"切线前进方向"
-        走一小段（``TAN_LEN_MM``），把目标点 Q 反投回像素，连线即可。
+        显示层优先使用像素域的近带→远带方向。这样在 ``CALIB:DEFAULT`` 或 H
+        还未准确标定时，箭头仍贴合屏幕上实际检测到的绿色中心线；地面切线
+        反投只作为缺少远带参考时的 fallback。
         """
+        if not bands:
+            return
+        near_band = bands[-1]
+        color = self.cfg.OSD_TANGENT_COLOR
+        thick = int(getattr(self.cfg, "OSD_TANGENT_THICKNESS", 2))
+
+        pixel_ref = self._forward_ref_from_pixels(bands)
+        if pixel_ref is not None:
+            p_near_px = self._band_pixel_point(near_band)
+            if p_near_px is None:
+                return
+            TANGENT_LEN_PX = 60.0
+            u_n, v_n = p_near_px
+            u_q = u_n + TANGENT_LEN_PX * pixel_ref[0]
+            v_q = v_n + TANGENT_LEN_PX * pixel_ref[1]
+            sx_d, sy_d = self.algo_xy_to_display(int(u_n), int(v_n))
+            ex_d, ey_d = self.algo_xy_to_display(int(u_q), int(v_q))
+            self._osd.draw_line(sx_d, sy_d, ex_d, ey_d, color=color, thickness=thick)
+            self._draw_arrow_head(sx_d, sy_d, ex_d, ey_d, color)
+            return
+
         # 近带地面点 P_near：用 mapper 把 (cx_px, mid_y) 投到地面
         cy = (near_band.y_top + near_band.y_bot) // 2
-        p_near_g = mapper.pixel_to_ground(float(near_band.cx_px), float(cy))
+        p_near_g = self._band_ground_point(mapper, near_band)
         if p_near_g is None:
             return
         x_n, y_n = p_near_g
+        forward_ref = self._forward_ref_from_bands(mapper, bands, p_near_g)
         # 切线方向（车体地面坐标系下）
         if path.arc_mode == "ransac":
             xc, yc = path.arc_xc, path.arc_yc
-            # 切线在 P_near 处的方向 ⊥ (P_near - C)；选与车头 +x 大致同向那个
+            # 切线在 P_near 处的方向 ⊥ (P_near - C)。
+            # 优先选择与"近带→更远带"观测方向一致的一支；这比仅用 tx>0
+            # 更稳，避免左右弯/噪声下箭头偶发指向可见圆弧内侧。
             rx = x_n - xc
             ry = y_n - yc
             r_norm = math.sqrt(rx * rx + ry * ry)
@@ -447,12 +543,22 @@ class DebugOverlay:
                 return
             tx = -ry / r_norm
             ty = rx / r_norm
-            if tx < 0.0:
+            if forward_ref is not None:
+                dot = tx * forward_ref[0] + ty * forward_ref[1]
+                if dot < 0.0:
+                    tx = -tx
+                    ty = -ty
+            elif tx < 0.0:
                 tx = -tx
                 ty = -ty
         elif path.arc_mode == "lsq":
             tx = path.line_tx
             ty = path.line_ty
+            if forward_ref is not None:
+                dot = tx * forward_ref[0] + ty * forward_ref[1]
+                if dot < 0.0:
+                    tx = -tx
+                    ty = -ty
         else:
             return
         TAN_LEN_MM = 200.0
@@ -467,8 +573,6 @@ class DebugOverlay:
         v_n = float(cy)
         sx_d, sy_d = self.algo_xy_to_display(int(u_n), int(v_n))
         ex_d, ey_d = self.algo_xy_to_display(int(u_q), int(v_q))
-        color = self.cfg.OSD_TANGENT_COLOR
-        thick = int(getattr(self.cfg, "OSD_TANGENT_THICKNESS", 2))
         self._osd.draw_line(sx_d, sy_d, ex_d, ey_d, color=color, thickness=thick)
         self._draw_arrow_head(sx_d, sy_d, ex_d, ey_d, color)
 
@@ -787,14 +891,19 @@ class DebugOverlay:
         return spans
 
     def algo_xy_to_display(self, x, y):
-        """算法坐标 (px @ 320×240) → 显示坐标 (px @ DISPLAY_WIDTH × DISPLAY_HEIGHT)。"""
-        sx = self.cfg.DISPLAY_WIDTH / float(self.cfg.ALGO_WIDTH)
-        sy = self.cfg.DISPLAY_HEIGHT / float(self.cfg.ALGO_HEIGHT)
-        return int(x * sx), int(y * sy)
+        """算法坐标 → OSD 坐标，按视频有效区域映射而非整块 LCD 拉伸。"""
+        sx = self._video_scale_x()
+        sy = self._video_scale_y()
+        return self._video_x() + int(x * sx), self._video_y() + int(y * sy)
 
     def _roi_algo_to_display(self, roi_algo):
-        """把算法坐标系下的 ROI 等比例缩放到显示坐标系。"""
+        """把算法坐标系下的 ROI 等比例缩放到视频有效区域。"""
         ax, ay, aw, ah = roi_algo
-        sx = self.cfg.DISPLAY_WIDTH / float(self.cfg.ALGO_WIDTH)
-        sy = self.cfg.DISPLAY_HEIGHT / float(self.cfg.ALGO_HEIGHT)
-        return (int(ax * sx), int(ay * sy), int(aw * sx), int(ah * sy))
+        sx = self._video_scale_x()
+        sy = self._video_scale_y()
+        return (
+            self._video_x() + int(ax * sx),
+            self._video_y() + int(ay * sy),
+            int(aw * sx),
+            int(ah * sy),
+        )

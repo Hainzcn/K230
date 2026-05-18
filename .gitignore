@@ -5,3 +5,6 @@
 # 标定结果（plan §11.1：每机单独一份，不进 git）
 calib.json
 calib_*.json
+
+/*/__pycache__
+__pycache__

@@ -35,6 +35,11 @@ class MS901MParser:
 
     GYRO_FSR_DPS  = 2000.0
     ACCEL_FSR_G   = 4.0
+    _EXPECTED_LEN = {
+        0x01: 6,
+        0x02: 8,
+        0x03: 12,
+    }
 
     # 状态机状态编号
     _S_SYNC1     = 0
@@ -83,6 +88,11 @@ class MS901MParser:
 
     # ------------------------------------------------------------------
 
+    def _resync_after_bad_byte(self, b):
+        """丢弃坏帧后尽量保留当前 0x55 作为下一帧同步头。"""
+        self.bad_frames += 1
+        self._state = self._S_SYNC2 if b == 0x55 else self._S_SYNC1
+
     def _process(self, b):
         s = self._state
         if s == self._S_SYNC1:
@@ -95,9 +105,16 @@ class MS901MParser:
                 # 非 0x55 丢弃，但当前字节本身不能是 sync1 的一部分
                 self._state = self._S_SYNC1
         elif s == self._S_ID:
+            if b not in self._EXPECTED_LEN:
+                self._resync_after_bad_byte(b)
+                return
             self._id    = b
             self._state = self._S_LEN
         elif s == self._S_LEN:
+            expected_len = self._EXPECTED_LEN.get(self._id)
+            if b != expected_len or b > len(self._data):
+                self._resync_after_bad_byte(b)
+                return
             self._len  = b
             self._didx = 0
             self._state = self._S_DATA if b > 0 else self._S_CHECKSUM
@@ -114,7 +131,8 @@ class MS901MParser:
                 self._dispatch()
                 self.good_frames += 1
             else:
-                self.bad_frames += 1
+                self._resync_after_bad_byte(b)
+                return
             self._state = self._S_SYNC1
 
     def _dispatch(self):
@@ -160,8 +178,12 @@ class MS901MParser:
             chk = (chk + b) & 0xFF
         frame = bytes([0x55, 0x55, 0x01, 0x06]) + bytes(data) + bytes([chk])
         p.feed(frame)
+        # 非法 LEN 必须丢弃并恢复同步，不能写爆内部 bytearray。
+        p.feed(bytes([0x55, 0x55, 0x01, 0x40, 0x55, 0x55, 0x01, 0x06])
+               + bytes(data) + bytes([chk]))
         ok = (
-            p.good_frames == 1
+            p.good_frames == 2
+            and p.bad_frames == 1
             and p.has_attitude
             and abs(p.pitch_deg - 90.0) < 0.01
             and p.roll_deg == 0.0

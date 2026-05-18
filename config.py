@@ -77,6 +77,8 @@ SENSOR_NOMINAL_FPS = 90
 
 # 显示通道（CHN0）输出尺寸：不得超过传感器原生分辨率（SENSOR_REQ_W/H）。
 # 当传感器原生 < LCD（800×480）时设为传感器原生，LCD 两侧留黑边。
+SENSOR_DISPLAY_X = 0
+SENSOR_DISPLAY_Y = 0
 SENSOR_DISPLAY_W = 640
 SENSOR_DISPLAY_H = 480
 

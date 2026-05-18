@@ -100,6 +100,15 @@ class MCUFrameParser:
         # 统计
         self.good = 0
         self.bad  = 0
+        self.bad_len = 0
+        self.bad_tail1 = 0
+        self.bad_tail2 = 0
+        self.bad_crc = 0
+        self.last_bad_reason = ""
+        self.last_bad_len = 0
+        self.last_bad_cmd = 0
+        self.last_bad_crc_rx = 0
+        self.last_bad_crc_calc = 0
         # 最近一帧（调试用）
         self.last_cmd     = 0
         self.last_payload = bytes()
@@ -124,6 +133,37 @@ class MCUFrameParser:
         """重置状态机。"""
         self._state = self._S_HEAD1
 
+    def _mark_bad(self, reason):
+        """记录坏帧原因，用于 K230 实板联调定位协议不匹配。"""
+        self.bad += 1
+        self.last_bad_reason = reason
+        self.last_bad_len = self._len
+        self.last_bad_cmd = self._cmd
+        self.last_bad_crc_rx = self._crc_rx
+        self.last_bad_crc_calc = 0
+        if reason == "len":
+            self.bad_len += 1
+        elif reason == "tail1":
+            self.bad_tail1 += 1
+        elif reason == "tail2":
+            self.bad_tail2 += 1
+        elif reason == "crc":
+            self.bad_crc += 1
+
+    def bad_stats(self):
+        """返回坏帧分类统计，供 5s 日志输出。"""
+        return (
+            self.bad_len,
+            self.bad_tail1,
+            self.bad_tail2,
+            self.bad_crc,
+            self.last_bad_reason,
+            self.last_bad_len,
+            self.last_bad_cmd,
+            self.last_bad_crc_rx,
+            self.last_bad_crc_calc,
+        )
+
     def _step(self, b):
         s = self._state
         if s == self._S_HEAD1:
@@ -138,7 +178,8 @@ class MCUFrameParser:
                 self._state = self._S_HEAD1
         elif s == self._S_LEN:
             if b > _PAYLOAD_MAX:
-                self.bad += 1
+                self._len = b
+                self._mark_bad("len")
                 self._state = self._S_HEAD1
             else:
                 self._len  = b
@@ -161,17 +202,19 @@ class MCUFrameParser:
         elif s == self._S_TAIL1:
             self._state = self._S_TAIL2 if b == 0x55 else self._S_HEAD1
             if b != 0x55:
-                self.bad += 1
+                self._mark_bad("tail1")
         elif s == self._S_TAIL2:
             self._state = self._S_HEAD1
             if b != 0xAA:
-                self.bad += 1
+                self._mark_bad("tail2")
                 return None
             crc_data = bytes([self._len, self._cmd]) + bytes(
                 self._payload[: self._len]
             )
-            if crc16_ccitt(crc_data) != self._crc_rx:
-                self.bad += 1
+            crc_calc = crc16_ccitt(crc_data)
+            if crc_calc != self._crc_rx:
+                self._mark_bad("crc")
+                self.last_bad_crc_calc = crc_calc
                 return None
             self.good += 1
             self.last_cmd     = self._cmd

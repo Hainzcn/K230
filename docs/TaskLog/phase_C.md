@@ -200,7 +200,9 @@ debug_overlay 内部画三层：
 3. **近带切线箭头**（橙，长 200 mm 在地面坐标系下走一段后反投）：从近带
    `(cx_near, mid_y)` 出发，方向 = 当前 arc / line 切线在像素域的投影。
    `arc_mode == "ransac"` 时切线 = ⊥(P_near − C)；`arc_mode == "lsq"`
-   时切线 = `LineResult.(tx, ty)`。
+   时切线 = `LineResult.(tx, ty)`。OSD 显示优先用像素域的"近带→更远
+   有效带"方向绘制箭头，缺少参考点时才回退到地面切线反投；这样在
+   `CALIB:DEFAULT` 或 H 未准确标定时，箭头仍贴合屏幕上的绿色中心线。
 
 `calib_mode == "none"` 时跳过几何（mapper=None），由文本行的红色
 `NO CALIB` 提示用户。

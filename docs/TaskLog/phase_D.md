@@ -372,7 +372,7 @@ MCU_UART2_RX_IO  = 6    # IO_6，Header NO.20
 ### 9.1 主循环 5 s 日志新增字段
 
 ```
-[VLT] ... mcu=ON bat=11250mV cps=+0 imu_g=200/b=0 mcu_g=50/b=0 ...
+[VLT] ... mcu=ON bat=10909mV cps=+0 imu_g=12345/b=0 mcu_g=600/b=0 ...
 ```
 
 | 字段 | 单位 | 含义 | 健康范围 |
@@ -382,6 +382,12 @@ MCU_UART2_RX_IO  = 6    # IO_6，Header NO.20
 | `cps` | counts/s | 左右轮平均速度（正=前进） | ±5000 视速度目标 |
 | `imu_g/b` | 帧数 | MS901M 解析好帧 / 坏帧 | bad 占比 < 0.1% |
 | `mcu_g/b` | 帧数 | MCU 命令帧好帧 / 坏帧 | bad 占比 < 0.1% |
+
+> 联调期曾临时打印 `uart_rx/last/avg_us/max_us/mcu_bad/last CRC` 等详细字段，
+> 用于定位 UART timeout、MCU 心跳 CRC 查表错误等问题。MCU 侧 CRC 修复后，
+> 这些字段已从常规 5 s 日志中移除；底层计数器仍保留，后续若再次排障可重新打开。
+
+历史联调中曾用上述详细字段定位 UART timeout、MS901M 坏帧与 MCU 心跳 CRC 查表错误；根因与修复记录已归档到 `docs/chore/Stage4-K230-Communication.md`，常规运行日志不再输出这些临时字段。
 
 ### 9.2 OSD 文本行（阶段 D 增量，约 1Hz 更新）
 
@@ -403,3 +409,7 @@ MCU 离线时该行标红显示 `MCU:OFF`。
 | 2026-05-18 | phaseD-0.3 | 修复 IMU 坏帧率 ~23%：drain() 改为 while-loop 循环读至缓冲空；_open_uart 加 timeout=0 防循环末尾阻塞；McuLink.drain() 同步改写 |
 | 2026-05-18 | phaseD-0.4 | 修复 drain() 阻塞主循环（FPS 12→21）：改用 uart.any()+read(n) 非阻塞模式；read()+default-timeout 阻塞 ~30ms，timeout=0 致 read(n) 在缓冲 <n 时返回 None；any()+read(n) 零阻塞且无副作用 |
 | 2026-05-18 | phaseD-0.5 | 修复 imu_g=3/b=1：uart.any() 在 K230 CanMV 缓冲首次读空后始终返回 0（驱动缺陷），导致所有后续 drain() 立即 return；改为 read(_READ_N)+timeout_ms，缓冲有数据时立即返回，无数据时等待至多 timeout 防主循环卡死 |
+| 2026-05-18 | phaseD-0.6 | UART 性能优化：IMU 从 512B/10ms 调整为 256B/3ms，MCU 从 128B/5ms 调整为 64B/1ms；新增 5s 日志中的 UART RX 字节与 drain avg/max us，便于确认 UART 不再抢占主循环预算 |
+| 2026-05-18 | phaseD-0.7 | 修复 MS901MParser 抗噪声问题：非法 ID/LEN 会计入 bad 并重新同步，避免错位字节把 LEN 解析成大值后触发 bytearray 越界 |
+| 2026-05-18 | phaseD-0.8 | 修复 MCU 在线判定：按最近一次合法 MCU 上行帧（VEHICLE_STATUS 或 HEARTBEAT_MCU）刷新在线时间，与 MCU 侧“无任何帧超时”语义对齐；心跳 CRC 异常继续通过 mcu_bad 统计追踪 |
+| 2026-05-18 | phaseD-0.9 | MCU 串口联调稳定后收敛 5s 日志：移除 `uart_rx/last/avg_us/max_us/mcu_bad/CRC` 等临时诊断字段，仅保留在线、电压、速度与好坏帧计数 |

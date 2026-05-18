@@ -590,14 +590,19 @@ def main():
                 # 阶段 D：MCU 链路统计
                 if mcu_link is not None:
                     mcu_good, mcu_bad = mcu_link.stats()
+                    if imu_link is not None:
+                        imu_good, imu_bad = imu_link.stats()
+                    else:
+                        imu_good = imu_bad = 0
                     mcu_log_str = (
-                        " mcu=%s bat=%dmV cps=%+d imu_g=%d/b=%d mcu_g=%d/b=%d"
+                        " mcu=%s bat=%dmV cps=%+d "
+                        "imu_g=%d/b=%d mcu_g=%d/b=%d"
                         % (
                             "ON" if mcu_online else "OFF",
                             mcu_link.vehicle_bat_mv,
                             mcu_link.vehicle_avg_cps,
-                            imu_link.stats()[0] if imu_link is not None else 0,
-                            imu_link.stats()[1] if imu_link is not None else 0,
+                            imu_good,
+                            imu_bad,
                             mcu_good,
                             mcu_bad,
                         )
