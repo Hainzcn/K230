@@ -22,6 +22,24 @@ DISPLAY_HEIGHT = 480
 DISPLAY_TO_IDE = True
 
 # ---------------------------------------------------------------------------
+# Sensor 硬件接口
+# ---------------------------------------------------------------------------
+# CSI0 接口上外接 OV5647 摄像头（已弃用板载摄像头）。
+# Sensor(id=SENSOR_ID, ...) 中 id 对应开发板 CSI 端口编号（0-2）。
+# 驱动日志会打印 ``find sensor ov5647_csiN`` 中的 N 即为此处的值。
+SENSOR_ID = 0   # CSI0，对应新接入的 OV5647
+
+# 焦点配置（软件路径）。
+# 注意：K230 CanMV 的 OV5647 驱动未注册 VCM 驱动，focus_caps() 返回
+# (0,0,0)，focus_pos() 为空操作。当前焦距须物理旋转镜头筒后锁定。
+# 若未来固件加入 VCM 支持，下列参数会自动生效：
+#   SENSOR_AUTOFOCUS = True   启用自动对焦
+#   SENSOR_AUTOFOCUS = False  手动定焦，焦点位置由 SENSOR_FOCUS_POS 指定
+#   SENSOR_FOCUS_POS          0（无穷远）~ maxPos（最近），赛车近距取大值
+SENSOR_AUTOFOCUS = False
+SENSOR_FOCUS_POS = 1000    # 极近端备用；当前由物理调焦实现
+
+# ---------------------------------------------------------------------------
 # Sensor 通道
 # ---------------------------------------------------------------------------
 # CHN0 → display (bind to LCD VIDEO1 layer，零拷贝)；CHN1 → algorithm。
@@ -39,7 +57,7 @@ ALGO_WIDTH = 320
 ALGO_HEIGHT = 240
 
 # Sensor 原生采集模式（必须三件套一起指定，只传 fps 不生效）。
-# 驱动日志形如 ``find sensor ov5647_csi2, output WxH@FPS``；如果日志显示的
+# 驱动日志形如 ``find sensor ov5647_csi0, output WxH@FPS``；如果日志显示的
 # W×H 不等于这里的 REQ 值，说明驱动没匹配到，自动回落到默认 1920×1080，而
 # 该默认模式在 OV5647 上最高只能 30 FPS。
 #
@@ -48,12 +66,19 @@ ALGO_HEIGHT = 240
 # GC2093 支持的 (w, h, fps)：
 #   1920×1080@30/60 / 1280×960@60 / 1280×720@90
 #
-# 目标 60 FPS：在 OV5647 上取 1280×720@60 是最小可行组合（>800 能覆盖
-# CHN0 800×480 下采样，320×240 CHN1 也够）。要到 90 FPS 必须把 CHN0
-# 降到 640×480 以下；暂不做。
-SENSOR_REQ_WIDTH = 1280
-SENSOR_REQ_HEIGHT = 720
-SENSOR_NOMINAL_FPS = 60
+# 采用低分辨率高帧率模式（OV5647 CSI0）：
+#   640×480@90 FPS — 传感器原生最高帧率模式。
+#   此模式下 CHN0（显示通道）输出不能超过 640×480，因此 SENSOR_DISPLAY_W/H
+#   设置为 640×480（在 800×480 LCD 上居左显示，两侧有黑边，仅作调试用）。
+#   CHN1（算法通道）320×240 仍可从 640×480 源正常下采样。
+SENSOR_REQ_WIDTH = 640
+SENSOR_REQ_HEIGHT = 480
+SENSOR_NOMINAL_FPS = 90
+
+# 显示通道（CHN0）输出尺寸：不得超过传感器原生分辨率（SENSOR_REQ_W/H）。
+# 当传感器原生 < LCD（800×480）时设为传感器原生，LCD 两侧留黑边。
+SENSOR_DISPLAY_W = 640
+SENSOR_DISPLAY_H = 480
 
 # ---------------------------------------------------------------------------
 # 算法 ROI（plan §4.3 三段权重子带；阶段 A 仅可视化，不做计算）
@@ -510,7 +535,7 @@ PHOTO_CALIB_PATH = "/sdcard/calib_photometric.json"
 #   UART(2, 921600) TX → MCU PB7 RX；RX ← MCU PB6 TX
 #   共 GND（MCU GND → K230 GND），严禁互接 5V 电源
 # ---------------------------------------------------------------------------
-COMMS_ENABLE = False          # bench 关闭，装车设 True
+COMMS_ENABLE = True          # bench 关闭，装车设 True
 
 # UART 通道号（可用：UART1 / UART2 / UART4；UART0=小核SH，UART3=大核SH，不可用）
 IMU_UART_ID  = 1              # UART1  115200，接 MS901M TX Y 分线（仅 RX）
@@ -523,18 +548,19 @@ MCU_UART_ID  = 2              # UART2  921600，接 MCU UART1（TX+RX 双向）
 #   IO_5  = UART2_TXD  ← K230 发 → MCU RX (MCU PB7)
 #   IO_6  = UART2_RXD  ← MCU TX (MCU PB6) → K230 收
 #
-# UART1（IMU 直通，仅 RX，Header NO.5 IO_20 复用）：
-#   IO_20 = UART1_RXD  ← MS901M TX Y 分线
-#   TX 引脚不分配（MS901M 单向推送，无需发送）
+# UART1（IMU 直通，仅 RX，Header NO.13/NO.18 JTAG 引脚复用）：
+#   IO_3 = UART1_TXD  → 必须配置，即使不发送（驱动要求 TX+RX 同时 FPIOA）
+#   IO_4 = UART1_RXD  ← MS901M TX Y 分线
 #
-# 注：K230 CanMV LP 板上 IO_20 在 Header NO.5，无其他专属功能，
-# 是 UART1 RX 的推荐自由引脚之一。装车后若该引脚有冲突，可改为
-# IO_27/IO_28/IO_30/IO_52/IO_53 等同等级空闲引脚，同步修改 FPIOA
-# 配置即可（仅需改此处常量）。
+# fpioa.help() 实测：
+#   IO_3 可用功能：GPIO3/JTAG_TDI/PULSE_CNTR1/UART1_TXD/RESV  (Header NO.18)
+#   IO_4 可用功能：GPIO4/JTAG_TDO/PULSE_CNTR2/UART1_RXD/RESV  (Header NO.13)
+# JTAG 在正常运行期间不占用这两个引脚，可安全复用为 UART1。
 # ---------------------------------------------------------------------------
 MCU_UART2_TX_IO  = 5          # IO_5  → UART2_TXD (Header NO.17)
 MCU_UART2_RX_IO  = 6          # IO_6  → UART2_RXD (Header NO.20)
-IMU_UART1_RX_IO  = 20         # IO_20 → UART1_RXD (Header NO.5，推荐空闲引脚)
+IMU_UART1_TX_IO  = 3          # IO_3  → UART1_TXD (Header NO.18，驱动要求配置，TX 实际不用)
+IMU_UART1_RX_IO  = 4          # IO_4  → UART1_RXD (Header NO.13)
 
 # MCU 心跳超时：超过此时长未收到 HEARTBEAT_MCU → K230 进入降级（发 mode=0）
 # plan §2.2 规定 MCU 侧 200 ms 未收 MOTION_CMD 就平衡保护；K230 侧放宽到

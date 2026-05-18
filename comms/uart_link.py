@@ -76,32 +76,50 @@ def _fpioa_setup_uart2(tx_io=5, rx_io=6):
         print("[uart_link] FPIOA UART2 setup failed: %s" % e)
 
 
-def _fpioa_setup_uart1_rx(rx_io=20):
-    """配置 UART1 RX FPIOA 映射（IMU 直通，仅 RX）。
+def _fpioa_setup_uart1(tx_io=3, rx_io=4):
+    """配置 UART1 TX+RX FPIOA 映射（IMU 直通）。
 
-    LP 板推荐：IO_20 (Header NO.5，空闲引脚)。
+    K230 CanMV UART 驱动要求 TX 和 RX 引脚同时配置，否则报
+    'tx not configured'，即使只使用 RX 也不例外。
+
+    LP 板可用引脚（来自 fpioa.help() 实测）：
+      IO_3 (Header NO.18) → UART1_TXD  (实际不发送，仅满足驱动要求)
+      IO_4 (Header NO.13) → UART1_RXD  ← MS901M TX Y 分线
     """
     if _FPIOA_CLASS is None:
         return
     try:
         fpioa = _FPIOA_CLASS()
+        fpioa.set_function(tx_io, getattr(_FPIOA_CLASS, "UART1_TXD"))
         fpioa.set_function(rx_io, getattr(_FPIOA_CLASS, "UART1_RXD"))
     except Exception as e:
-        print("[uart_link] FPIOA UART1 RX setup failed: %s" % e)
+        print("[uart_link] FPIOA UART1 setup failed: %s" % e)
 
 
-def _open_uart(uart_id, baudrate):
-    """创建并返回 UART 实例；machine 不可用时返回 None。"""
+def _open_uart(uart_id, baudrate, timeout_ms=None):
+    """创建并返回 UART 实例；machine 不可用时返回 None。
+
+    timeout_ms 含义（K230 CanMV 实测）：
+      - 默认（不传）：read(n) 阻塞到 n 字节到齐；read() 无参追加 ~30ms 惰性等待
+      - 显式数值：read(n) 最多等待该时长（ms），超时后返回已读到的部分字节
+      - 0：read(n) 在缓冲 <n 时立即返回 None（无数据时完全无效，勿用）
+
+    uart.any() 在 K230 CanMV 上缓冲首次读空后始终返回 0，
+    不能用于非阻塞轮询，必须依赖 read(n)+timeout 控制阻塞时长。
+    """
     if _UART_CLASS is None:
         return None
     hw_id = _UART_ID_MAP.get(uart_id, uart_id)
     try:
-        return _UART_CLASS(
-            hw_id, baudrate=baudrate,
+        kwargs = dict(
+            baudrate=baudrate,
             bits=_UART_CLASS.EIGHTBITS,
             parity=_UART_CLASS.PARITY_NONE,
             stop=_UART_CLASS.STOPBITS_ONE,
         )
+        if timeout_ms is not None:
+            kwargs["timeout"] = timeout_ms
+        return _UART_CLASS(hw_id, **kwargs)
     except Exception as e:
         print("[uart_link] open UART(%d, %d) failed: %s" % (uart_id, baudrate, e))
         return None
@@ -117,30 +135,44 @@ class ImuLink:
     bench 模式（uart=None）下 drain() 是空操作，snapshot() 返回 None。
     """
 
-    BAUD = 115200
-    READ_BYTES = 64      # 200 Hz 时每 5 ms 约 ~72 B；每帧读 64 B 足够
+    BAUD      = 115200
+    # 每轮 K230 主循环（目标 ~20Hz = 50ms）积压量：
+    #   200Hz × 41B × 50ms ≈ 410B → 取 512B 留余量，确保缓冲有足够数据时立即返回
+    # timeout_ms=10：缓冲不足时最多等待 10ms，防止主循环被卡住
+    _READ_N     = 512
+    _TIMEOUT_MS = 10
 
-    def __init__(self, uart_id=1, rx_io=20):
+    def __init__(self, uart_id=1, tx_io=3, rx_io=4):
         """
         Args:
             uart_id: UART 通道号（K230 可用：1 / 2 / 4）
-            rx_io:   FPIOA RX 引脚号（默认 IO_20，Header NO.5）
+            tx_io:   FPIOA TX 引脚号（默认 IO_3，Header NO.18；驱动要求配置，实际不发送）
+            rx_io:   FPIOA RX 引脚号（默认 IO_4，Header NO.13）
         """
         self._parser = MS901MParser()
-        # FPIOA：将指定 IO 配置为 UART1_RXD（仅 RX，不分配 TX）
+        # FPIOA：TX+RX 必须同时配置，否则 UART 驱动拒绝打开
         if uart_id == 1:
-            _fpioa_setup_uart1_rx(rx_io)
-        self._uart   = _open_uart(uart_id, self.BAUD)
+            _fpioa_setup_uart1(tx_io, rx_io)
+        self._uart = _open_uart(uart_id, self.BAUD, timeout_ms=self._TIMEOUT_MS)
         if self._uart is None:
             print("[imu_link] bench mode (no UART)")
         else:
-            print("[imu_link] UART%d @%d RX=IO_%d opened" % (uart_id, self.BAUD, rx_io))
+            print("[imu_link] UART%d @%d TX=IO_%d RX=IO_%d timeout=%dms opened"
+                  % (uart_id, self.BAUD, tx_io, rx_io, self._TIMEOUT_MS))
 
     def drain(self):
-        """读取 UART RX 缓冲并喂给解析器。主循环每帧调用一次。"""
+        """读取 UART RX 缓冲，喂给解析器。主循环每帧调用一次。
+
+        使用 read(_READ_N)：
+          - 缓冲已有 ≥_READ_N 字节（常态：200Hz IMU 每 50ms 积压 410B）→ 立即返回
+          - 缓冲不足时等待至多 _TIMEOUT_MS ms → 以部分数据返回，不阻塞主循环
+
+        注：uart.any() 在 K230 CanMV 上缓冲首次读空后始终返回 0（驱动缺陷），
+        不可用于非阻塞轮询。
+        """
         if self._uart is None:
             return
-        data = self._uart.read(self.READ_BYTES)
+        data = self._uart.read(self._READ_N)
         if data:
             self._parser.feed(data)
 
@@ -176,8 +208,9 @@ class McuLink:
     bench 模式（uart=None）下 drain/send 均为空操作。
     """
 
-    BAUD       = 921600
-    READ_BYTES = 128
+    BAUD         = 921600
+    _READ_N      = 128   # MCU 单帧 ≤20B，128B 足以一次读完积压帧
+    _TIMEOUT_MS  = 5     # MCU 离线时最多阻塞 5ms；在线时 128B@921600 约 1.4ms 即到
 
     def __init__(self, uart_id=2, timeout_ms=500, tx_io=5, rx_io=6):
         """
@@ -187,7 +220,7 @@ class McuLink:
             tx_io:      FPIOA TX 引脚号（默认 IO_5，Header NO.17 = UART2_TXD）
             rx_io:      FPIOA RX 引脚号（默认 IO_6，Header NO.20 = UART2_RXD）
         """
-        self._parser   = MCUFrameParser()
+        self._parser     = MCUFrameParser()
         self._timeout_ms = timeout_ms
         self._last_hb_ms = time.ticks_ms()
 
@@ -199,19 +232,22 @@ class McuLink:
         if uart_id == 2:
             _fpioa_setup_uart2(tx_io, rx_io)
 
-        self._uart = _open_uart(uart_id, self.BAUD)
+        self._uart = _open_uart(uart_id, self.BAUD, timeout_ms=self._TIMEOUT_MS)
         if self._uart is None:
             print("[mcu_link] bench mode (no UART)")
         else:
-            print("[mcu_link] UART%d @%d TX=IO_%d RX=IO_%d opened"
-                  % (uart_id, self.BAUD, tx_io, rx_io))
+            print("[mcu_link] UART%d @%d TX=IO_%d RX=IO_%d timeout=%dms opened"
+                  % (uart_id, self.BAUD, tx_io, rx_io, self._TIMEOUT_MS))
 
     # ------------------------------------------------------------------
     # 接收
     # ------------------------------------------------------------------
 
     def drain(self, now_ms=None):
-        """读取 RX 缓冲，解析帧，更新内部状态。
+        """非阻塞读取 RX 缓冲，解析帧，更新内部状态。
+
+        使用 uart.any() + read(n) 模式：MCU 未接线时 any()==0 立即返回，
+        不阻塞主循环。
 
         Args:
             now_ms: 当前 ticks_ms（传入可减少 ticks_ms 调用次数）
@@ -221,17 +257,15 @@ class McuLink:
         if now_ms is None:
             now_ms = time.ticks_ms()
 
-        data = self._uart.read(self.READ_BYTES)
-        if not data:
-            return
-
-        for cmd, payload in self._parser.feed(data):
-            if cmd == CMD_VEHICLE_STATUS and len(payload) >= 7:
-                self.vehicle_avg_cps, self.vehicle_safety, self.vehicle_bat_mv = (
-                    parse_vehicle_status(payload)
-                )
-            elif cmd == CMD_HEARTBEAT_MCU:
-                self._last_hb_ms = now_ms
+        data = self._uart.read(self._READ_N)
+        if data:
+            for cmd, payload in self._parser.feed(data):
+                if cmd == CMD_VEHICLE_STATUS and len(payload) >= 7:
+                    self.vehicle_avg_cps, self.vehicle_safety, self.vehicle_bat_mv = (
+                        parse_vehicle_status(payload)
+                    )
+                elif cmd == CMD_HEARTBEAT_MCU:
+                    self._last_hb_ms = now_ms
 
     # ------------------------------------------------------------------
     # 状态查询

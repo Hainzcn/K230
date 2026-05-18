@@ -92,13 +92,16 @@ class Camera:
         if self._sensor is None:
             return
         print(
-            "[camera] request: sensor=%dx%d@%d, "
-            "display→CHN%d=%s, algo→CHN%d=%s"
+            "[camera] request: CSI%d sensor=%dx%d@%d, "
+            "display→CHN%d(%dx%d)=%s, algo→CHN%d=%s"
             % (
+                self.cfg.SENSOR_ID,
                 self.cfg.SENSOR_REQ_WIDTH,
                 self.cfg.SENSOR_REQ_HEIGHT,
                 self.cfg.SENSOR_NOMINAL_FPS,
                 self.cfg.DISPLAY_CHN,
+                self.cfg.SENSOR_DISPLAY_W,
+                self.cfg.SENSOR_DISPLAY_H,
                 self.cfg.DISPLAY_PIXFORMAT,
                 self.cfg.ALGO_CHN,
                 self.cfg.ALGO_PIXFORMAT,
@@ -130,12 +133,17 @@ class Camera:
             Sensor() → reset → set_framesize/pixformat (CHN0) → bind_layer
             → set_framesize/pixformat (CHN1) → Display.init → MediaManager.init
 
-        必须**三件套一起**传给 ``Sensor(width=, height=, fps=)``。只传 fps
+        必须**四件套一起**传给 ``Sensor(id=, width=, height=, fps=)``。
+        ``id`` 指定 CSI 端口（0 = CSI0，对应 config.SENSOR_ID）；只传 fps
         时驱动会保留默认 1920×1080，而 OV5647 在 1920×1080 下最高 30 FPS
-        （其 60 FPS 只支持 ≤ 1280×720），期望的 fps 会被静默忽略，表现为
+        （其 90 FPS 只支持 640×480），期望的 fps 会被静默忽略，表现为
         algo_fps 顽固地停在 30.0 不动。
+
+        CHN0 显示通道输出不得超过传感器原生分辨率（SENSOR_DISPLAY_W/H），
+        与 LCD 物理尺寸（DISPLAY_WIDTH/HEIGHT）解耦，由 config 单独控制。
         """
         self._sensor = Sensor(
+            id=self.cfg.SENSOR_ID,
             width=self.cfg.SENSOR_REQ_WIDTH,
             height=self.cfg.SENSOR_REQ_HEIGHT,
             fps=self.cfg.SENSOR_NOMINAL_FPS,
@@ -145,10 +153,13 @@ class Camera:
         self._sensor.set_vflip(True)
 
         # ---- CHN0：显示通道 ----
+        # 输出尺寸上限为传感器原生分辨率（SENSOR_DISPLAY_W/H），不能超过
+        # SENSOR_REQ_WIDTH/HEIGHT；LCD 物理尺寸（DISPLAY_WIDTH/HEIGHT）
+        # 用于 Display.init 和 OSD，两者独立。
         self._sensor.set_framesize(
             chn=self._display_chn,
-            width=self.cfg.DISPLAY_WIDTH,
-            height=self.cfg.DISPLAY_HEIGHT,
+            width=self.cfg.SENSOR_DISPLAY_W,
+            height=self.cfg.SENSOR_DISPLAY_H,
         )
         self._sensor.set_pixformat(
             _PIXFORMAT_NAME_TO_ENUM[self.cfg.DISPLAY_PIXFORMAT],
@@ -196,12 +207,57 @@ class Camera:
 
         return self
 
+    def _apply_focus(self):
+        """在 sensor.run() 之后尝试软件调焦。
+
+        K230 CanMV 的 OV5647 驱动未注册 VCM 驱动，focus_caps() 会返回
+        (0, 0, 0)（isSupport=0），此时 focus_pos() 为空操作。
+        实际焦距须**物理旋转镜头筒**调节后锁定。
+        若未来固件版本加入 VCM 支持（isSupport=1），软件路径会自动生效。
+        """
+        try:
+            caps = self._sensor.focus_caps()
+        except Exception as e:
+            print("[camera] focus_caps() error (non-fatal):", e)
+            return
+
+        # caps = (isSupport, minPos, maxPos)
+        if not caps or not caps[0]:
+            print(
+                "[camera] focus: VCM not supported by firmware "
+                "(caps=%s) — adjust lens barrel physically" % str(caps)
+            )
+            return
+
+        min_pos, max_pos = int(caps[1]), int(caps[2])
+        if self.cfg.SENSOR_AUTOFOCUS:
+            try:
+                self._sensor.auto_focus(True)
+                print("[camera] focus: auto")
+            except Exception as e:
+                print("[camera] auto_focus failed (non-fatal):", e)
+        else:
+            pos = max(min_pos, min(max_pos, self.cfg.SENSOR_FOCUS_POS))
+            try:
+                self._sensor.focus_pos(pos)
+                print(
+                    "[camera] focus: manual pos=%d (range %d~%d)"
+                    % (pos, min_pos, max_pos)
+                )
+            except Exception as e:
+                print("[camera] focus_pos failed (non-fatal):", e)
+
     def start(self):
-        """启动 sensor 数据流。MediaManager.init 之后调用（参见 Sensor 文档）。"""
+        """启动 sensor 数据流。MediaManager.init 之后调用（参见 Sensor 文档）。
+
+        焦点配置在 sensor.run() **之后**应用：sensor fd 由内核在 run() 启动
+        数据流时才真正打开，MediaManager.init() 只建立媒体图，fd 尚未就绪。
+        """
         if self._sensor is None:
             raise RuntimeError("Camera.init() must be called before start()")
         self._sensor.run()
         self._sensor_running = True
+        self._apply_focus()
         self._debug_overlay.reset_fps_window(time.ticks_ms())
         return self
 

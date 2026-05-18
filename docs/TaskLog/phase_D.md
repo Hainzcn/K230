@@ -96,6 +96,24 @@ K230 侧：
 - `ImuLink` / `McuLink` 内部若 `machine` 不可用，uart 实例为 None，所有 drain/send 为空操作
 - 视觉算法链路（Phase A/B/C）完全不受影响
 
+### 2.4.1 IMU 数据速率与 drain 策略
+
+MS901M 以 **200Hz** 速率主动推送三种帧（每周期 5ms，依次发送 0x01→0x02→0x03）：
+
+| 帧 ID | 内容 | LEN | 完整帧长 |
+|:---:|---|:---:|:---:|
+| 0x01 | 姿态 roll/pitch/yaw | 6 | **11 B** |
+| 0x02 | 四元数 q0~q3 | 8 | **13 B** |
+| 0x03 | 陀螺 + 加速度 | 12 | **17 B** |
+| — | 合计每周期 | — | **41 B** |
+
+- **总字节率**：200 Hz × 41 B = **8200 B/s**（信道利用率 71.2%，115200 baud = 11520 B/s）
+- **每 K230 主循环积累量**：8200 × 48ms ≈ **394 B**
+
+> 若每次 `drain()` 仅读 64 B，连续积压后 UART 硬件缓冲区（通常 256~512B）溢出，导致帧头丢失，坏帧率实测高达 **~23%**。
+>
+> 修复方案：`drain()` 改为 `while True: read(256)` 循环读至缓冲为空，配合 **`timeout=0` 非阻塞** 打开 UART（否则循环末次 `read()` 会阻塞主循环）。
+
 ### 2.5 主循环集成点
 
 ```python
@@ -137,7 +155,7 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
   │  GND ──────────────────┐     │                                        │
   └────────────────────────│─────│────────────────────────────────────────┘
                            │     │  Y 分线（直接短接或 100Ω 隔离电阻）
-                           │     └──→ K230 IO_20 (Header NO.5, UART1_RXD)
+                           │     └──→ K230 IO_4  (Header NO.13, UART1_RXD)
                            │
   ┌──────────────────────────────────────────────────────────────────────┐
   │  MSPM0G3507 MCU                                                       │
@@ -159,7 +177,8 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 | Header NO. | 引脚标签 | 本项目用途 | 连接目标 |
 |:---:|---|---|---|
 | **2 / 4 / 37** | GND | 公共地 | MCU GND（任选一脚，建议靠近信号线的 NO.37） |
-| **5** | IO_20 | UART1_RXD（IMU 直通） | MS901M TX Y 分支路 |
+| **13** | JTAG_TDO / IO_4 | UART1_RXD（IMU 直通） | MS901M TX Y 分支路 |
+| **18** | JTAG_TDI / IO_3 | UART1_TXD（仅 FPIOA，不接线） | — |
 | **17** | UART2_TXD / IO_5 | UART2 TX → MCU RX | MCU PB7（UART1_RX） |
 | **20** | UART2_RXD / IO_6 | UART2 RX ← MCU TX | MCU PB6（UART1_TX） |
 
@@ -167,6 +186,12 @@ if ticks_diff(now, last_hb_ms) >= HB_SEND_INTERVAL_MS:
 > - UART0：小核 SH 占用，**禁用**
 > - UART3：大核 SH 占用，**禁用**
 > - **UART1 / UART2 / UART4：用户可用**
+>
+> **UART1 引脚限制**（来自 `fpioa.help()` 实测）：
+> - UART1_TXD 只能分配到 **IO_3** 或 IO_9
+> - UART1_RXD 只能分配到 **IO_4** 或 IO_10
+> - K230 CanMV UART 驱动**要求 TX/RX 同时配置 FPIOA**，否则报 `tx not configured`，即使只接收也不例外
+> - IO_3/IO_4 默认功能为 JTAG_TDI/TDO，正常运行期间不占用，可安全复用
 
 ---
 
@@ -192,7 +217,8 @@ MS901M TX 信号需 **Y 分**同时馈入 MCU UART3_RX 和 K230 UART1_RXD。
 
 | 线号 | K230 端 | K230 Header | 方向 | 来源 |
 |:---:|---|:---:|:---:|---|
-| ④ | IO_20 (UART1_RXD) | **NO.5** | MS901M → K230 | MS901M TX Y 分支路 |
+| ④ | IO_4 (UART1_RXD) | **NO.13** | MS901M → K230 | MS901M TX Y 分支路 |
+| — | IO_3 (UART1_TXD) | NO.18 | **不接线** | 仅 FPIOA 软件配置，驱动必须 |
 | — | — | — | — | MS901M TX → MCU UART3_RX（已完成） |
 
 **Y 分接法**：
@@ -200,18 +226,16 @@ MS901M TX 信号需 **Y 分**同时馈入 MCU UART3_RX 和 K230 UART1_RXD。
 ```
 MS901M TX ──┬──→ MCU UART3_RX（已有线）
             │
-            └──→ K230 Header NO.5（IO_20）
+            └──→ K230 Header NO.13（IO_4）
 ```
 
 短接距离 < 20 cm 时可直接短接；若导线较长（> 30 cm）建议在 K230 分支串联 **100 Ω** 隔离电阻，防止反射干扰 MCU 侧接收。
 
-> K230 侧无需接 MS901M RX（MS901M 单向推送，K230 只读不写）。
+> K230 侧 IO_3（Header NO.18，UART1_TXD）**无需接任何线**，只需在 FPIOA 软件层配置，否则驱动报 `tx not configured` 拒绝打开 UART1。
 
 ---
 
 ### 3.5 FPIOA 软件配置（由 `comms/uart_link.py` 自动完成）
-
-K230 CanMV 启动时 IO_20 默认为 GPIO，**必须通过 FPIOA 重映射为 UART1_RXD**；IO_5 / IO_6 在 LP4 板出厂时已映射为 UART2_TXD/RXD，但代码仍显式设置以防固件差异。
 
 `comms/uart_link.py` 中 `ImuLink.__init__` / `McuLink.__init__` 会在 `UART()` 打开前自动调用以下等效操作：
 
@@ -219,22 +243,27 @@ K230 CanMV 启动时 IO_20 默认为 GPIO，**必须通过 FPIOA 重映射为 UA
 from machine import FPIOA
 fpioa = FPIOA()
 
-# 链路二：UART1 RX（IMU，IO_20 = Header NO.5）
-fpioa.set_function(20, FPIOA.UART1_RXD)
+# 链路二：UART1 TX+RX（IMU，IO_3/IO_4 = Header NO.18/NO.13）
+# K230 UART 驱动要求 TX 和 RX 同时配置 FPIOA，即使只使用 RX
+fpioa.set_function(3, FPIOA.UART1_TXD)   # IO_3，不接线，仅满足驱动要求
+fpioa.set_function(4, FPIOA.UART1_RXD)   # IO_4，接 MS901M TX Y 分线
 
 # 链路一：UART2 TX/RX（MCU 命令，IO_5/IO_6 = Header NO.17/NO.20）
 fpioa.set_function(5, FPIOA.UART2_TXD)
 fpioa.set_function(6, FPIOA.UART2_RXD)
 ```
 
-引脚号由 `config.py` 统一管理，如需更换：
+引脚号由 `config.py` 统一管理：
 
 ```python
-# config.py（装车后如有冲突，修改此处即可）
-IMU_UART1_RX_IO  = 20   # 可改为 27/28/30/52/53 等空闲引脚
-MCU_UART2_TX_IO  = 5    # Header NO.17，通常不变
-MCU_UART2_RX_IO  = 6    # Header NO.20，通常不变
+# config.py
+IMU_UART1_TX_IO  = 3    # IO_3，Header NO.18（JTAG_TDI 复用，不接线）
+IMU_UART1_RX_IO  = 4    # IO_4，Header NO.13（JTAG_TDO 复用，接 MS901M TX）
+MCU_UART2_TX_IO  = 5    # IO_5，Header NO.17
+MCU_UART2_RX_IO  = 6    # IO_6，Header NO.20
 ```
+
+> **为何不能用 IO_20**：`fpioa.help()` 实测显示 IO_20 可用功能为 `GPIO20/RESV/RESV/RESV/RESV`，不含 UART 功能，`set_function(20, UART1_RXD)` 会报 `set pin func failed`。UART1 的 RXD 只能分配到 IO_4 或 IO_10。
 
 ---
 
@@ -245,7 +274,8 @@ MCU_UART2_RX_IO  = 6    # Header NO.20，通常不变
 - [ ] K230 Header NO.17（IO_5）→ MCU PB7，线序正确（TX→RX）
 - [ ] K230 Header NO.20（IO_6）← MCU PB6，线序正确（RX←TX）
 - [ ] K230 Header NO.37（GND）→ MCU GND，共地连接
-- [ ] K230 Header NO.5（IO_20）← MS901M TX Y 分支路
+- [ ] K230 Header NO.13（IO_4）← MS901M TX Y 分支路
+- [ ] K230 Header NO.18（IO_3）**不接线**（仅 FPIOA 软件配置，驱动要求）
 - [ ] MS901M GND → MCU GND → K230 GND，三方共地
 - [ ] 无 5 V 电源接入 MCU / MS901M 信号引脚
 - [ ] 所有杜邦线插到位（轻拉不脱），无短路
@@ -254,10 +284,10 @@ MCU_UART2_RX_IO  = 6    # Header NO.20，通常不变
 
 - [ ] `config.py` 中 `COMMS_ENABLE = True`
 - [ ] `config.py` 中 `IMU_UART_ID = 1`、`MCU_UART_ID = 2`（默认正确）
-- [ ] `config.py` 中 `IMU_UART1_RX_IO = 20`（或实际用的空闲引脚）
+- [ ] `config.py` 中 `IMU_UART1_TX_IO = 3`、`IMU_UART1_RX_IO = 4`（默认正确，勿改）
 - [ ] 运行 `vision_line_tracking.py`，启动日志应出现：
   ```
-  [imu_link] UART1 @115200 RX=IO_20 opened
+  [imu_link] UART1 @115200 TX=IO_3 RX=IO_4 opened
   [mcu_link] UART2 @921600 TX=IO_5 RX=IO_6 opened
   ```
 
@@ -369,3 +399,7 @@ MCU 离线时该行标红显示 `MCU:OFF`。
 |------|------|------|
 | 2026-05-17 | phaseD-0.1 | 初版：comms/ 四模块 + vision_line_tracking.py 集成 + tools/uart_dump.py |
 | 2026-05-18 | phaseD-0.1 | 补充 §3 硬件接线指引：拓扑图、引脚汇总表、FPIOA 代码说明、上电前检查清单 |
+| 2026-05-18 | phaseD-0.2 | 修复 UART1 FPIOA：IO_20 无 UART 功能，改为 IO_3(TX)+IO_4(RX)；uart_link.py 同时配置 TX+RX；更新 config.py、接线指引 |
+| 2026-05-18 | phaseD-0.3 | 修复 IMU 坏帧率 ~23%：drain() 改为 while-loop 循环读至缓冲空；_open_uart 加 timeout=0 防循环末尾阻塞；McuLink.drain() 同步改写 |
+| 2026-05-18 | phaseD-0.4 | 修复 drain() 阻塞主循环（FPS 12→21）：改用 uart.any()+read(n) 非阻塞模式；read()+default-timeout 阻塞 ~30ms，timeout=0 致 read(n) 在缓冲 <n 时返回 None；any()+read(n) 零阻塞且无副作用 |
+| 2026-05-18 | phaseD-0.5 | 修复 imu_g=3/b=1：uart.any() 在 K230 CanMV 缓冲首次读空后始终返回 0（驱动缺陷），导致所有后续 drain() 立即 return；改为 read(_READ_N)+timeout_ms，缓冲有数据时立即返回，无数据时等待至多 timeout 防主循环卡死 |

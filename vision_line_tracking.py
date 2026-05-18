@@ -127,7 +127,8 @@ def _setup_comms(cfg):
             return None, None
         imu_link = ImuLink(
             uart_id = getattr(cfg, "IMU_UART_ID", 1),
-            rx_io   = getattr(cfg, "IMU_UART1_RX_IO", 20),
+            tx_io   = getattr(cfg, "IMU_UART1_TX_IO", 3),
+            rx_io   = getattr(cfg, "IMU_UART1_RX_IO", 4),
         )
         mcu_link = McuLink(
             uart_id    = getattr(cfg, "MCU_UART_ID", 2),
